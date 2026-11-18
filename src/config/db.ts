@@ -1,31 +1,58 @@
 
 import { Db, MongoClient } from "mongodb";
 
-let client: MongoClient;
-let database: Db;
+let client: MongoClient | null = null;
+let database: Db | null = null;
+let connectionPromise: Promise<void> | null = null;
 
 export const connectDB = async (): Promise<void> => {
-  try {
-    const uri = process.env.MONGODB_URI;
-
-    if (!uri) {
-      throw new Error("MONGODB_URI is missing in .env file");
-    }
-
-    client = new MongoClient(uri);
-
-    await client.connect();
-
-    database = client.db("mentorlagbe");
-
-    await database.command({ ping: 1 });
-
-    console.log("MongoDB Connected Successfully!");
-    console.log("Database: mentorlagbe");
-  } catch (error) {
-    console.error("MongoDB Connection Failed:", error);
-    process.exit(1);
+  if (database) {
+    return;
   }
+
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  connectionPromise = (async () => {
+    try {
+      const uri = process.env.MONGODB_URI;
+
+      if (!uri) {
+        throw new Error("MONGODB_URI is missing.");
+      }
+
+      if (!client) {
+        client = new MongoClient(uri);
+      }
+
+      await client.connect();
+
+      const db = client.db("mentorlagbe");
+
+      await db.command({ ping: 1 });
+
+      database = db;
+
+      console.log("MongoDB Connected Successfully!");
+      console.log("Database: mentorlagbe");
+    } catch (error) {
+      console.error("MongoDB Connection Failed:", error);
+
+      if (client) {
+        await client.close().catch(() => undefined);
+      }
+
+      client = null;
+      database = null;
+
+      throw error;
+    } finally {
+      connectionPromise = null;
+    }
+  })();
+
+  return connectionPromise;
 };
 
 export const getDB = (): Db => {

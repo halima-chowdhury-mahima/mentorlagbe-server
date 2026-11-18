@@ -2,12 +2,12 @@
   "name": "mentorlagbe-server",
   "version": "1.0.0",
   "description": "MentorLagbe - Smart Tuition & Mentorship Platform",
-  "main": "dist/server.js",
-  "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc",
-    "start": "node dist/server.js"
-  },
+ "main": "dist/index.js",
+"scripts": {
+  "dev": "tsx watch src/index.ts",
+  "build": "tsc",
+  "start": "node dist/index.js"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
