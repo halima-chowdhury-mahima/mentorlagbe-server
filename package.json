@@ -1,6 +1,9 @@
 {
   "name": "mentorlagbe-server",
   "version": "1.0.0",
+   "engines": {
+    "node": "26.x"
+  },
   "description": "MentorLagbe - Smart Tuition & Mentorship Platform",
  "main": "dist/index.js",
 "scripts": {

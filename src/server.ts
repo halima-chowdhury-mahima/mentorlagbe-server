@@ -13,6 +13,7 @@ import adminRoutes from "./routes/admin.routes.js";
 import paymentRoutes from "./routes/payment.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
 import bookmarkRoutes from "./routes/bookmark.routes.js";
+import profileRoutes from "./routes/profile.routes.js";
 
 export const createApp = async (): Promise<Express> => {
   await connectDB();
@@ -66,6 +67,7 @@ export const createApp = async (): Promise<Express> => {
   app.use("/api/tutor", tutorRoutes);
   app.use("/api/admin", adminRoutes);
   app.use("/api/payments", paymentRoutes);
+  app.use("/api/profile", profileRoutes);
 
   // Root API
   app.get("/", (_req, res) => {
