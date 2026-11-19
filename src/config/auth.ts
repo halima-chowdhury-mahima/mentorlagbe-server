@@ -5,32 +5,35 @@ import { jwt } from "better-auth/plugins";
 
 import { getDB } from "./db.js";
 
+const SERVER_URL =
+  process.env.BETTER_AUTH_URL ||
+  "http://localhost:5000";
+
+const CLIENT_URLS = (
+  process.env.CLIENT_URL ||
+  "http://localhost:3000"
+)
+  .split(",")
+  .map((url) => url.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+const SECRET = process.env.BETTER_AUTH_SECRET;
+
+if (!SECRET) {
+  throw new Error("BETTER_AUTH_SECRET is missing.");
+}
+
 export const createAuth = () => {
-  const baseURL = (
-    process.env.BETTER_AUTH_URL || "http://localhost:5000"
-  ).replace(/\/+$/, "");
-
-  const trustedOrigins = (
-    process.env.CLIENT_URL || "http://localhost:3000"
-  )
-    .split(",")
-    .map((origin) => origin.trim().replace(/\/+$/, ""))
-    .filter(Boolean);
-
-  const secret = process.env.BETTER_AUTH_SECRET;
-
-  if (!secret) {
-    throw new Error("BETTER_AUTH_SECRET is missing.");
-  }
-
   return betterAuth({
+    appName: "MentorLagbe",
+
+    baseURL: SERVER_URL.replace(/\/+$/, ""),
+
+    secret: SECRET,
+
     database: mongodbAdapter(getDB()),
 
-    baseURL,
-
-    secret,
-
-    trustedOrigins,
+    trustedOrigins: CLIENT_URLS,
 
     emailAndPassword: {
       enabled: true,
@@ -58,8 +61,8 @@ export const createAuth = () => {
     plugins: [
       jwt({
         jwt: {
-          issuer: baseURL,
-          audience: baseURL,
+          issuer: SERVER_URL.replace(/\/+$/, ""),
+          audience: SERVER_URL.replace(/\/+$/, ""),
           expirationTime: "15m",
 
           definePayload: ({ user }) => ({
