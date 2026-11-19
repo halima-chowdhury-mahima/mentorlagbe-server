@@ -13,7 +13,9 @@ const router = Router();
 
 router.use(verifyToken, verifyAdmin);
 
-// Get all tuition posts
+// ==========================================
+// GET ALL TUITIONS
+// ==========================================
 router.get("/tuitions", async (_req, res, next) => {
   try {
     const { tuitions } = getCollections();
@@ -25,6 +27,7 @@ router.get("/tuitions", async (_req, res, next) => {
 
     res.status(200).json({
       success: true,
+      total: result.length,
       data: result,
     });
   } catch (error) {
@@ -32,7 +35,9 @@ router.get("/tuitions", async (_req, res, next) => {
   }
 });
 
-// Approve or reject tuition
+// ==========================================
+// APPROVE OR REJECT TUITION
+// ==========================================
 router.patch("/tuitions/:id/status", async (req, res, next) => {
   try {
     const id = req.params.id;
@@ -84,7 +89,9 @@ router.patch("/tuitions/:id/status", async (req, res, next) => {
   }
 });
 
-// Get all Better Auth users
+// ==========================================
+// GET ALL BETTER AUTH USERS
+// ==========================================
 router.get("/users", async (_req, res, next) => {
   try {
     const result = await getDB()
@@ -102,6 +109,7 @@ router.get("/users", async (_req, res, next) => {
 
     res.status(200).json({
       success: true,
+      total: result.length,
       data: result,
     });
   } catch (error) {
@@ -109,7 +117,9 @@ router.get("/users", async (_req, res, next) => {
   }
 });
 
-// Get all payments
+// ==========================================
+// GET ALL PAYMENTS
+// ==========================================
 router.get("/payments", async (_req, res, next) => {
   try {
     const { payments } = getCollections();
@@ -121,7 +131,91 @@ router.get("/payments", async (_req, res, next) => {
 
     res.status(200).json({
       success: true,
+      total: result.length,
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ==========================================
+// GET ALL APPLICATIONS
+// ==========================================
+router.get("/applications", async (_req, res, next) => {
+  try {
+    const { applications } = getCollections();
+
+    const result = await applications
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      total: result.length,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ==========================================
+// UPDATE APPLICATION STATUS
+// ==========================================
+router.patch("/applications/:id/status", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+
+    if (!id || !ObjectId.isValid(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid application ID",
+      });
+      return;
+    }
+
+    const { status } = req.body;
+
+    const allowedStatuses = [
+      "pending",
+      "accepted",
+      "rejected",
+      "cancelled",
+    ];
+
+    if (!allowedStatuses.includes(status)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid application status",
+      });
+      return;
+    }
+
+    const { applications } = getCollections();
+
+    const result = await applications.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      res.status(404).json({
+        success: false,
+        message: "Application not found",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Application status updated successfully",
     });
   } catch (error) {
     next(error);
