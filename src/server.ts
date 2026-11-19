@@ -4,7 +4,7 @@ import cors from "cors";
 import { toNodeHandler } from "better-auth/node";
 
 import { connectDB } from "./config/db.js";
-import auth from "./config/auth.js";
+import createAuth from "./config/auth.js";
 
 import tuitionRoutes from "./routes/tuition.routes.js";
 import applicationRoutes from "./routes/application.routes.js";
@@ -16,15 +16,18 @@ import bookmarkRoutes from "./routes/bookmark.routes.js";
 import profileRoutes from "./routes/profile.routes.js";
 
 export const createApp = async (): Promise<Express> => {
+  // 1. Connect MongoDB first
   await connectDB();
 
+  // 2. Validate environment variables
   if (!process.env.BETTER_AUTH_SECRET) {
     throw new Error("BETTER_AUTH_SECRET is missing.");
   }
 
+  // 3. Initialize Express
   const app = express();
 
-  // Allowed frontend origins
+  // 4. Configure allowed frontend origins
   const allowedOrigins = new Set(
     [
       "http://localhost:3000",
@@ -36,11 +39,10 @@ export const createApp = async (): Promise<Express> => {
       .map((origin) => origin.replace(/\/+$/, ""))
   );
 
-  // CORS configuration
+  // 5. CORS configuration
   app.use(
     cors({
       origin: (origin, callback) => {
-        // Allow requests without an Origin header (e.g. server-to-server)
         if (!origin) {
           return callback(null, true);
         }
@@ -51,10 +53,19 @@ export const createApp = async (): Promise<Express> => {
           return callback(null, true);
         }
 
-        return callback(new Error(`CORS blocked origin: ${origin}`));
+        return callback(
+          new Error(`CORS blocked origin: ${origin}`)
+        );
       },
       credentials: true,
-      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      methods: [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+      ],
       allowedHeaders: [
         "Content-Type",
         "Authorization",
@@ -64,22 +75,22 @@ export const createApp = async (): Promise<Express> => {
     })
   );
 
-  // Better Auth handler
-  // Keep this before express.json() so Better Auth can process its own requests.
-  
+  // 6. Initialize Better Auth AFTER MongoDB connection
+  const auth = createAuth();
+
+  // 7. Better Auth routes
   app.all("/api/auth/*splat", toNodeHandler(auth));
 
-
-  // Stripe webhook must receive the raw request body.
+  // 8. Stripe webhook - preserve raw body
   app.use(
     "/api/payments/webhook",
     express.raw({ type: "application/json" })
   );
 
-  // JSON parser for the remaining API routes.
+  // 9. JSON parser
   app.use(express.json({ limit: "12mb" }));
 
-  // API routes
+  // 10. API routes
   app.use("/api/uploads", uploadRoutes);
   app.use("/api/bookmarks", bookmarkRoutes);
   app.use("/api/tuitions", tuitionRoutes);
@@ -89,7 +100,7 @@ export const createApp = async (): Promise<Express> => {
   app.use("/api/payments", paymentRoutes);
   app.use("/api/profile", profileRoutes);
 
-  // Root API
+  // 11. Root API
   app.get("/", (_req, res) => {
     res.status(200).json({
       success: true,
@@ -97,7 +108,7 @@ export const createApp = async (): Promise<Express> => {
     });
   });
 
-  // Health check
+  // 12. Health check
   app.get("/api/health", (_req, res) => {
     res.status(200).json({
       success: true,
