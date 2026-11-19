@@ -6,12 +6,10 @@ import { jwt } from "better-auth/plugins";
 import { getDB } from "./db.js";
 
 const SERVER_URL =
-  process.env.BETTER_AUTH_URL ||
-  "http://localhost:5000";
+  process.env.BETTER_AUTH_URL || "http://localhost:5000";
 
 const CLIENT_URLS = (
-  process.env.CLIENT_URL ||
-  "http://localhost:3000"
+  process.env.CLIENT_URL || "http://localhost:3000"
 )
   .split(",")
   .map((url) => url.trim().replace(/\/+$/, ""))
@@ -23,57 +21,57 @@ if (!SECRET) {
   throw new Error("BETTER_AUTH_SECRET is missing.");
 }
 
-export const createAuth = () => {
-  return betterAuth({
-    appName: "MentorLagbe",
+const auth = betterAuth({
+  appName: "MentorLagbe",
 
-    baseURL: SERVER_URL.replace(/\/+$/, ""),
+  baseURL: SERVER_URL.replace(/\/+$/, ""),
 
-    secret: SECRET,
+  secret: SECRET,
 
-    database: mongodbAdapter(getDB()),
+  database: mongodbAdapter(getDB()),
 
-    trustedOrigins: CLIENT_URLS,
+  trustedOrigins: CLIENT_URLS,
 
-    emailAndPassword: {
-      enabled: true,
-      minPasswordLength: 8,
-      maxPasswordLength: 128,
-    },
+  emailAndPassword: {
+    enabled: true,
+    minPasswordLength: 8,
+    maxPasswordLength: 128,
+  },
 
-    user: {
-      additionalFields: {
-        role: {
-          type: "string",
-          required: true,
-          defaultValue: "student",
-          input: false,
-        },
-        plan: {
-          type: "string",
-          required: true,
-          defaultValue: "free",
-          input: false,
-        },
+  user: {
+    additionalFields: {
+      role: {
+        type: "string",
+        required: true,
+        defaultValue: "student",
+        input: false,
+      },
+      plan: {
+        type: "string",
+        required: true,
+        defaultValue: "free",
+        input: false,
       },
     },
+  },
 
-    plugins: [
-      jwt({
-        jwt: {
-          issuer: SERVER_URL.replace(/\/+$/, ""),
-          audience: SERVER_URL.replace(/\/+$/, ""),
-          expirationTime: "15m",
+  plugins: [
+    jwt({
+      jwt: {
+        issuer: SERVER_URL.replace(/\/+$/, ""),
+        audience: SERVER_URL.replace(/\/+$/, ""),
+        expirationTime: "15m",
 
-          definePayload: ({ user }) => ({
-            id: user.id,
-            name: user.name,
-            email: user.email,
-            role: user.role,
-            plan: user.plan,
-          }),
-        },
-      }),
-    ],
-  });
-};
+        definePayload: ({ user }) => ({
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          plan: user.plan,
+        }),
+      },
+    }),
+  ],
+});
+
+export default auth;

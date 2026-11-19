@@ -4,7 +4,7 @@ import cors from "cors";
 import { toNodeHandler } from "better-auth/node";
 
 import { connectDB } from "./config/db.js";
-import { createAuth } from "./config/auth.js";
+import auth from "./config/auth.js";
 
 import tuitionRoutes from "./routes/tuition.routes.js";
 import applicationRoutes from "./routes/application.routes.js";
@@ -24,39 +24,59 @@ export const createApp = async (): Promise<Express> => {
 
   const app = express();
 
-  const allowedOrigins = new Set([
-    "http://localhost:3000",
-    ...(process.env.CLIENT_URL || "")
-      .split(",")
-      .map((origin) => origin.trim().replace(/\/+$/, ""))
-      .filter(Boolean),
-  ]);
+  // Allowed frontend origins
+  const allowedOrigins = new Set(
+    [
+      "http://localhost:3000",
+      ...(process.env.CLIENT_URL || "")
+        .split(",")
+        .map((origin) => origin.trim()),
+    ]
+      .filter(Boolean)
+      .map((origin) => origin.replace(/\/+$/, ""))
+  );
 
+  // CORS configuration
   app.use(
     cors({
       origin: (origin, callback) => {
-        if (!origin || allowedOrigins.has(origin)) {
-          callback(null, true);
-        } else {
-          callback(new Error("Not allowed by CORS"));
+        // Allow requests without an Origin header (e.g. server-to-server)
+        if (!origin) {
+          return callback(null, true);
         }
+
+        const normalizedOrigin = origin.replace(/\/+$/, "");
+
+        if (allowedOrigins.has(normalizedOrigin)) {
+          return callback(null, true);
+        }
+
+        return callback(new Error(`CORS blocked origin: ${origin}`));
       },
       credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+      ],
+      maxAge: 86400,
     })
   );
 
   // Better Auth handler
-  const auth = createAuth();
-
+  // Keep this before express.json() so Better Auth can process its own requests.
+  
   app.all("/api/auth/*splat", toNodeHandler(auth));
 
-  // Stripe webhook: raw body must be preserved
+
+  // Stripe webhook must receive the raw request body.
   app.use(
     "/api/payments/webhook",
     express.raw({ type: "application/json" })
   );
 
-  // JSON parser
+  // JSON parser for the remaining API routes.
   app.use(express.json({ limit: "12mb" }));
 
   // API routes
@@ -77,6 +97,7 @@ export const createApp = async (): Promise<Express> => {
     });
   });
 
+  // Health check
   app.get("/api/health", (_req, res) => {
     res.status(200).json({
       success: true,
