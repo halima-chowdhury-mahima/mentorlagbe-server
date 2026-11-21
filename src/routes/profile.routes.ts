@@ -15,6 +15,10 @@ type AuthUser = {
   plan: string;
 };
 
+const getAuthenticatedUser = (
+  res: Parameters<Parameters<typeof router.get>[1]>[1]
+) => res.locals.user as AuthUser;
+
 const allowedFields = [
   "name",
   "image",
@@ -36,15 +40,101 @@ const allowedFields = [
   "preferredLocation",
 ] as const;
 
-const getAuthenticatedUser = (res: Parameters<Parameters<typeof router.get>[1]>[1]) =>
-  res.locals.user as AuthUser;
+// ==========================================
+// SELECT STUDENT OR TUTOR ROLE
+// ==========================================
+router.patch("/role", async (req, res, next) => {
+  try {
+    const user = getAuthenticatedUser(res);
+    const requestedRole = req.body?.role;
 
+    if (!["student", "tutor"].includes(requestedRole)) {
+      res.status(400).json({
+        success: false,
+        message: "Role must be student or tutor.",
+      });
+      return;
+    }
+
+    if (user.role === "admin") {
+      res.status(403).json({
+        success: false,
+        message: "Admin role cannot be changed.",
+      });
+      return;
+    }
+
+    const users = getDB().collection("user");
+
+    const existingUser = await users.findOne({ email: user.email });
+
+    if (!existingUser) {
+      res.status(404).json({
+        success: false,
+        message: "User account not found.",
+      });
+      return;
+    }
+
+    // Allow retrying the same selection, but prevent changing
+    // a role after the initial selection.
+    if (existingUser.roleSelectedAt) {
+      if (existingUser.role === requestedRole) {
+        res.status(200).json({
+          success: true,
+          message: "Role already selected.",
+          role: existingUser.role,
+        });
+        return;
+      }
+
+      res.status(409).json({
+        success: false,
+        message: "Your account role has already been selected.",
+      });
+      return;
+    }
+
+    const result = await users.updateOne(
+      {
+        email: user.email,
+        roleSelectedAt: { $exists: false },
+      },
+      {
+        $set: {
+          role: requestedRole,
+          roleSelectedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      res.status(409).json({
+        success: false,
+        message: "Role selection could not be completed.",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Account role selected successfully.",
+      role: requestedRole,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ==========================================
+// GET MY PROFILE
+// ==========================================
 router.get("/me", async (_req, res, next) => {
   try {
     const user = getAuthenticatedUser(res);
     const users = getDB().collection("user");
 
-    // Better Auth user is identified by its email.
     const profile = await users.findOne(
       { email: user.email },
       { projection: { password: 0 } }
@@ -73,6 +163,9 @@ router.get("/me", async (_req, res, next) => {
   }
 });
 
+// ==========================================
+// UPDATE MY PROFILE
+// ==========================================
 router.patch("/me", async (req, res, next) => {
   try {
     const user = getAuthenticatedUser(res);
@@ -126,7 +219,6 @@ router.patch("/me", async (req, res, next) => {
 
     updateData.updatedAt = new Date();
 
-    // Update the existing Better Auth user; never create a duplicate account.
     const result = await users.updateOne(
       { email: user.email },
       { $set: updateData }

@@ -21,8 +21,10 @@ if (!SECRET) {
   throw new Error("BETTER_AUTH_SECRET is missing.");
 }
 
-const createAuth = () => {
-  return betterAuth({
+const PRODUCTION = process.env.NODE_ENV === "production";
+
+const createAuth = () =>
+  betterAuth({
     appName: "MentorLagbe",
 
     baseURL: SERVER_URL.replace(/\/+$/, ""),
@@ -32,6 +34,14 @@ const createAuth = () => {
     database: mongodbAdapter(getDB()),
 
     trustedOrigins: CLIENT_URLS,
+
+    advanced: {
+      defaultCookieAttributes: {
+        sameSite: PRODUCTION ? "none" : "lax",
+        secure: PRODUCTION,
+        httpOnly: true,
+      },
+    },
 
     emailAndPassword: {
       enabled: true,
@@ -47,6 +57,7 @@ const createAuth = () => {
           defaultValue: "student",
           input: false,
         },
+
         plan: {
           type: "string",
           required: true,
@@ -74,6 +85,5 @@ const createAuth = () => {
       }),
     ],
   });
-};
 
 export default createAuth;
