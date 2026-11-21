@@ -13,6 +13,24 @@ const router = Router();
 
 router.use(verifyToken, verifyAdmin);
 
+type RequestBody = Record<string, unknown>;
+
+function getBody(value: unknown): RequestBody {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  ) {
+    return value as RequestBody;
+  }
+
+  return {};
+}
+
+function getId(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] || "" : value || "";
+}
+
 // ==========================================
 // GET ALL TUITIONS
 // ==========================================
@@ -36,26 +54,50 @@ router.get("/tuitions", async (_req, res, next) => {
 });
 
 // ==========================================
+// GET PENDING TUITIONS
+// ==========================================
+router.get("/tuitions/pending", async (_req, res, next) => {
+  try {
+    const { tuitions } = getCollections();
+
+    const result = await tuitions
+      .find({
+        approvalStatus: "pending",
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      total: result.length,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ==========================================
 // APPROVE OR REJECT TUITION
 // ==========================================
 router.patch("/tuitions/:id/status", async (req, res, next) => {
   try {
-    const id = req.params.id;
+    const id = getId(req.params.id);
+    const body = getBody(req.body);
+    const status = body.status;
 
     if (!id || !ObjectId.isValid(id)) {
       res.status(400).json({
         success: false,
-        message: "Invalid tuition ID",
+        message: "Invalid tuition ID.",
       });
       return;
     }
 
-    const { status } = req.body;
-
-    if (!["approved", "rejected"].includes(status)) {
+    if (status !== "approved" && status !== "rejected") {
       res.status(400).json({
         success: false,
-        message: "Status must be approved or rejected",
+        message: "Status must be approved or rejected.",
       });
       return;
     }
@@ -63,9 +105,12 @@ router.patch("/tuitions/:id/status", async (req, res, next) => {
     const { tuitions } = getCollections();
 
     const result = await tuitions.updateOne(
-      { _id: new ObjectId(id) },
+      {
+        _id: new ObjectId(id),
+      },
       {
         $set: {
+          approvalStatus: status,
           status,
           updatedAt: new Date(),
         },
@@ -75,14 +120,14 @@ router.patch("/tuitions/:id/status", async (req, res, next) => {
     if (result.matchedCount === 0) {
       res.status(404).json({
         success: false,
-        message: "Tuition not found",
+        message: "Tuition not found.",
       });
       return;
     }
 
     res.status(200).json({
       success: true,
-      message: `Tuition ${status} successfully`,
+      message: `Tuition ${status} successfully.`,
     });
   } catch (error) {
     next(error);
@@ -148,7 +193,7 @@ router.get("/applications", async (_req, res, next) => {
 
     const result = await applications
       .find({})
-      .sort({ createdAt: -1 })
+      .sort({ appliedAt: -1 })
       .toArray();
 
     res.status(200).json({
@@ -166,17 +211,17 @@ router.get("/applications", async (_req, res, next) => {
 // ==========================================
 router.patch("/applications/:id/status", async (req, res, next) => {
   try {
-    const id = req.params.id;
+    const id = getId(req.params.id);
+    const body = getBody(req.body);
+    const status = body.status;
 
     if (!id || !ObjectId.isValid(id)) {
       res.status(400).json({
         success: false,
-        message: "Invalid application ID",
+        message: "Invalid application ID.",
       });
       return;
     }
-
-    const { status } = req.body;
 
     const allowedStatuses = [
       "pending",
@@ -185,10 +230,13 @@ router.patch("/applications/:id/status", async (req, res, next) => {
       "cancelled",
     ];
 
-    if (!allowedStatuses.includes(status)) {
+    if (
+      typeof status !== "string" ||
+      !allowedStatuses.includes(status)
+    ) {
       res.status(400).json({
         success: false,
-        message: "Invalid application status",
+        message: "Invalid application status.",
       });
       return;
     }
@@ -196,7 +244,9 @@ router.patch("/applications/:id/status", async (req, res, next) => {
     const { applications } = getCollections();
 
     const result = await applications.updateOne(
-      { _id: new ObjectId(id) },
+      {
+        _id: new ObjectId(id),
+      },
       {
         $set: {
           status,
@@ -208,14 +258,14 @@ router.patch("/applications/:id/status", async (req, res, next) => {
     if (result.matchedCount === 0) {
       res.status(404).json({
         success: false,
-        message: "Application not found",
+        message: "Application not found.",
       });
       return;
     }
 
     res.status(200).json({
       success: true,
-      message: "Application status updated successfully",
+      message: "Application status updated successfully.",
     });
   } catch (error) {
     next(error);

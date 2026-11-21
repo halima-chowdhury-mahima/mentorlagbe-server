@@ -12,93 +12,185 @@ const router = Router();
 
 router.use(verifyToken, verifyTutor);
 
+type TutorUser = {
+  id: string;
+  name?: string;
+  email?: string;
+  plan?: string;
+};
+
+type RequestBody = Record<string, unknown>;
+
+function getBody(value: unknown): RequestBody {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  ) {
+    return value as RequestBody;
+  }
+
+  return {};
+}
+
+function getString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getNumber(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    return Number(value);
+  }
+  return Number.NaN;
+}
+
+function getStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.filter(
+    (item): item is string => typeof item === "string"
+  ).map((item) => item.trim()).filter(Boolean);
+}
+
+function getId(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] || "" : value || "";
+}
+
 // ==========================================
 // CREATE A NEW TUITION POST
 // ==========================================
 router.post("/my-tuitions", async (req, res, next) => {
   try {
-    const user = res.locals.user as { id: string };
+    const user = res.locals.user as TutorUser;
+    const body = getBody(req.body);
     const { tuitions } = getCollections();
 
-    const body = req.body ?? {};
+    const title = getString(body.title);
+    const classLevel = getString(body.classLevel);
+    const location = getString(body.location);
+    const area = getString(body.area);
 
-    // Validate required fields
+    const subjects = getStringArray(body.subjects);
+    const subject =
+      getString(body.subject) ||
+      subjects.join(", ");
+
+    const monthlyFee = getNumber(
+      body.monthlyFee ?? body.salary
+    );
+
+    const requestedMode = getString(body.mode);
+    const tuitionType = getString(body.tuitionType);
+
+    const mode =
+      requestedMode === "Online" || requestedMode === "Offline"
+        ? requestedMode
+        : tuitionType === "Online" || tuitionType === "Offline"
+          ? tuitionType
+          : tuitionType === "Home"
+            ? "Offline"
+            : "";
+
     if (
-      !body.title?.trim() ||
-      !body.classLevel ||
-      !body.location?.trim() ||
-      !body.area?.trim() ||
-      !Array.isArray(body.subjects) ||
-      body.subjects.length === 0
+      !title ||
+      !classLevel ||
+      !location ||
+      !subject ||
+      !Number.isFinite(monthlyFee) ||
+      monthlyFee <= 0 ||
+      !mode
     ) {
       res.status(400).json({
         success: false,
-        message: "Please provide all required tuition information.",
+        message:
+          "Please provide title, subject, class level, location, mode (Online/Offline), and a valid monthly fee.",
       });
       return;
     }
 
-    const salary = Number(body.salary);
-
-    if (!Number.isFinite(salary) || salary <= 0) {
-      res.status(400).json({
-        success: false,
-        message: "Please provide a valid monthly salary.",
+    // Free Tutor: maximum 2 tuition posts.
+    // Pro Tutor: unlimited tuition posts.
+    if (user.plan?.toLowerCase() !== "pro") {
+      const existingCount = await tuitions.countDocuments({
+        tutorId: user.id,
       });
-      return;
+
+      if (existingCount >= 2) {
+        res.status(403).json({
+          success: false,
+          message:
+            "Free plan allows a maximum of 2 tuition posts. Upgrade to Pro to post unlimited tuitions.",
+          code: "TUITION_LIMIT_REACHED",
+        });
+        return;
+      }
     }
 
     const now = new Date();
 
+    const daysPerWeek = getNumber(body.daysPerWeek);
+    const safeDaysPerWeek =
+      Number.isInteger(daysPerWeek) &&
+      daysPerWeek >= 1 &&
+      daysPerWeek <= 7
+        ? daysPerWeek
+        : 3;
+
+    const bannerImage =
+      getString(body.bannerImage) ||
+      getString(body.image);
+
     const tuitionData = {
-      title: String(body.title).trim(),
+      title,
+      subject,
+      classLevel,
 
-      subject:
-        body.subject ||
-        body.subjects.join(", "),
+      // Assignment 9 fields
+      mode,
+      monthlyFee,
+      daysPerWeek,
+      bannerImage,
+      description: getString(body.description),
 
-      subjects: body.subjects,
+      location,
+      tutorName: user.name || "Tutor",
+      tutorEmail: user.email || "",
 
-      classLevel: body.classLevel,
-      medium: body.medium || "Bangla Medium",
-      curriculum: body.curriculum || "NCTB",
+      approvalStatus: "pending",
+      isActive: true,
 
-      category: body.category || "Home Tuition",
-      tuitionType: body.tuitionType || "Home",
+      // Legacy fields retained for existing frontend compatibility
+      subjects: subjects.length > 0 ? subjects : [subject],
+      medium: getString(body.medium),
+      curriculum: getString(body.curriculum) || "NCTB",
+      category: getString(body.category) || "Home Tuition",
+      tuitionType: tuitionType || "Home",
+      area,
 
-      location: String(body.location).trim(),
-      area: String(body.area).trim(),
-
-      salary,
-
+      salary: monthlyFee,
       negotiable: body.negotiable === true,
+      hoursPerDay: getNumber(body.hoursPerDay) || 2,
+      schedule: getString(body.schedule),
+      tutoringTime: getString(body.tutoringTime) || "Evening",
 
-      daysPerWeek: Number(body.daysPerWeek) || 3,
-      hoursPerDay: Number(body.hoursPerDay) || 2,
+      studentGender: getString(body.studentGender) || "Any",
+      tutorGender: getString(body.tutorGender) || "Any",
+      numberOfStudents: getNumber(body.numberOfStudents) || 1,
 
-      schedule: body.schedule || "",
-      tutoringTime: body.tutoringTime || "Evening",
+      institution: getString(body.institution),
+      qualification: getString(body.qualification),
+      experience: getString(body.experience) || "Preferred",
+      requirements: getString(body.requirements),
 
-      studentGender: body.studentGender || "Any",
-      tutorGender: body.tutorGender || "Any",
-
-      numberOfStudents: Number(body.numberOfStudents) || 1,
-
-      institution: body.institution || "",
-      qualification: body.qualification || "",
-      experience: body.experience || "Preferred",
-
-      requirements: body.requirements || "",
-      description: body.description || "",
-
-      contactPerson: body.contactPerson || "",
-      contactNumber: body.contactNumber || "",
-
+      contactPerson: getString(body.contactPerson),
+      contactNumber: getString(body.contactNumber),
       applicationDeadline: body.applicationDeadline || null,
 
       tutorId: user.id,
 
-      status: "active",
+      // Legacy status now reflects approval, not active/inactive.
+      status: "pending",
 
       createdAt: now,
       updatedAt: now,
@@ -108,7 +200,7 @@ router.post("/my-tuitions", async (req, res, next) => {
 
     res.status(201).json({
       success: true,
-      message: "Tuition published successfully!",
+      message: "Tuition submitted for admin approval.",
       data: {
         _id: result.insertedId,
         ...tuitionData,
@@ -124,7 +216,7 @@ router.post("/my-tuitions", async (req, res, next) => {
 // ==========================================
 router.get("/my-tuitions", async (_req, res, next) => {
   try {
-    const user = res.locals.user as { id: string };
+    const user = res.locals.user as TutorUser;
     const { tuitions } = getCollections();
 
     const result = await tuitions
@@ -142,25 +234,80 @@ router.get("/my-tuitions", async (_req, res, next) => {
 });
 
 // ==========================================
-// GET APPLICANTS FOR A SPECIFIC TUITION
+// TOGGLE TUITION ACTIVE / INACTIVE
 // ==========================================
-router.get("/applicants/:tuitionId", async (req, res, next) => {
+router.patch("/my-tuitions/:id/active", async (req, res, next) => {
   try {
-    const tuitionIdParam = req.params.tuitionId;
+    const user = res.locals.user as TutorUser;
+    const id = getId(req.params.id);
+    const body = getBody(req.body);
 
-    const tuitionId = Array.isArray(tuitionIdParam)
-      ? tuitionIdParam[0]
-      : tuitionIdParam;
-
-    if (!tuitionId || !ObjectId.isValid(tuitionId)) {
+    if (!id || !ObjectId.isValid(id)) {
       res.status(400).json({
         success: false,
-        message: "Invalid tuition ID",
+        message: "Invalid tuition ID.",
       });
       return;
     }
 
-    const user = res.locals.user as { id: string };
+    if (typeof body.isActive !== "boolean") {
+      res.status(400).json({
+        success: false,
+        message: "isActive must be true or false.",
+      });
+      return;
+    }
+
+    const { tuitions } = getCollections();
+
+    const result = await tuitions.updateOne(
+      {
+        _id: new ObjectId(id),
+        tutorId: user.id,
+      },
+      {
+        $set: {
+          isActive: body.isActive,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      res.status(404).json({
+        success: false,
+        message: "Tuition not found.",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: body.isActive
+        ? "Tuition activated successfully."
+        : "Tuition deactivated successfully.",
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ==========================================
+// GET APPLICANTS FOR A SPECIFIC TUITION
+// ==========================================
+router.get("/applicants/:tuitionId", async (req, res, next) => {
+  try {
+    const user = res.locals.user as TutorUser;
+    const tuitionId = getId(req.params.tuitionId);
+
+    if (!tuitionId || !ObjectId.isValid(tuitionId)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid tuition ID.",
+      });
+      return;
+    }
+
     const { tuitions, applications } = getCollections();
 
     const tuition = await tuitions.findOne({
@@ -171,14 +318,14 @@ router.get("/applicants/:tuitionId", async (req, res, next) => {
     if (!tuition) {
       res.status(404).json({
         success: false,
-        message: "Tuition not found",
+        message: "Tuition not found.",
       });
       return;
     }
 
     const result = await applications
       .find({ tuitionId })
-      .sort({ createdAt: -1 })
+      .sort({ appliedAt: -1 })
       .toArray();
 
     res.status(200).json({
@@ -191,37 +338,33 @@ router.get("/applicants/:tuitionId", async (req, res, next) => {
 });
 
 // ==========================================
-// APPROVE OR REJECT AN APPLICANT
+// ACCEPT OR REJECT AN APPLICANT
 // ==========================================
 router.patch(
   "/applicants/:applicationId/status",
   async (req, res, next) => {
     try {
-      const applicationIdParam = req.params.applicationId;
-
-      const applicationId = Array.isArray(applicationIdParam)
-        ? applicationIdParam[0]
-        : applicationIdParam;
-
-      const { status } = req.body;
+      const user = res.locals.user as TutorUser;
+      const applicationId = getId(req.params.applicationId);
+      const body = getBody(req.body);
+      const status = getString(body.status).toLowerCase();
 
       if (!applicationId || !ObjectId.isValid(applicationId)) {
         res.status(400).json({
           success: false,
-          message: "Invalid application ID",
+          message: "Invalid application ID.",
         });
         return;
       }
 
-      if (!["approved", "rejected"].includes(status)) {
+      if (status !== "accepted" && status !== "rejected") {
         res.status(400).json({
           success: false,
-          message: "Status must be approved or rejected",
+          message: "Status must be accepted or rejected.",
         });
         return;
       }
 
-      const user = res.locals.user as { id: string };
       const { applications, tuitions } = getCollections();
 
       const application = await applications.findOne({
@@ -231,31 +374,30 @@ router.patch(
       if (!application) {
         res.status(404).json({
           success: false,
-          message: "Application not found",
+          message: "Application not found.",
         });
         return;
       }
 
-      const tuitionId = application.tuitionId;
+      const tuitionId = String(application.tuitionId || "");
 
-      if (!tuitionId || !ObjectId.isValid(String(tuitionId))) {
+      if (!ObjectId.isValid(tuitionId)) {
         res.status(400).json({
           success: false,
-          message: "Invalid tuition reference in application",
+          message: "Invalid tuition reference in application.",
         });
         return;
       }
 
-      // Ensure this tuition belongs to the logged-in tutor
       const tuition = await tuitions.findOne({
-        _id: new ObjectId(String(tuitionId)),
+        _id: new ObjectId(tuitionId),
         tutorId: user.id,
       });
 
       if (!tuition) {
         res.status(403).json({
           success: false,
-          message: "You cannot manage this application",
+          message: "You cannot manage this application.",
         });
         return;
       }
@@ -272,7 +414,7 @@ router.patch(
 
       res.status(200).json({
         success: true,
-        message: `Application ${status} successfully`,
+        message: `Application ${status} successfully.`,
       });
     } catch (error) {
       next(error);
@@ -281,38 +423,40 @@ router.patch(
 );
 
 // ==========================================
-// UPDATE TUTOR'S TUITION
+// UPDATE TUTOR'S OWN TUITION
 // ==========================================
 router.patch("/my-tuitions/:id", async (req, res, next) => {
   try {
-    const idParam = req.params.id;
-    const id = Array.isArray(idParam) ? idParam[0] : idParam;
+    const user = res.locals.user as TutorUser;
+    const id = getId(req.params.id);
+    const body = getBody(req.body);
 
     if (!id || !ObjectId.isValid(id)) {
       res.status(400).json({
         success: false,
-        message: "Invalid tuition ID",
+        message: "Invalid tuition ID.",
       });
       return;
     }
-
-    const user = res.locals.user as { id: string };
-    const { tuitions } = getCollections();
 
     const allowedFields = [
       "title",
       "subject",
       "subjects",
       "classLevel",
+      "mode",
+      "monthlyFee",
+      "daysPerWeek",
+      "bannerImage",
+      "description",
+      "location",
+      "area",
+      "salary",
       "medium",
       "curriculum",
       "category",
       "tuitionType",
-      "location",
-      "area",
-      "salary",
       "negotiable",
-      "daysPerWeek",
       "hoursPerDay",
       "schedule",
       "tutoringTime",
@@ -323,47 +467,59 @@ router.patch("/my-tuitions/:id", async (req, res, next) => {
       "qualification",
       "experience",
       "requirements",
-      "description",
       "contactPerson",
       "contactNumber",
       "applicationDeadline",
-      "status",
     ];
 
     const updateData: Record<string, unknown> = {};
 
     for (const field of allowedFields) {
-      if (req.body[field] !== undefined) {
-        updateData[field] = req.body[field];
+      if (body[field] !== undefined) {
+        updateData[field] = body[field];
       }
+    }
+
+    // Keep the legacy salary field synchronized with monthlyFee.
+    if (body.monthlyFee !== undefined) {
+      updateData.salary = body.monthlyFee;
+    } else if (body.salary !== undefined) {
+      updateData.monthlyFee = body.salary;
     }
 
     if (Object.keys(updateData).length === 0) {
       res.status(400).json({
         success: false,
-        message: "No valid fields provided for update",
+        message: "No valid fields provided for update.",
       });
       return;
     }
 
     updateData.updatedAt = new Date();
 
+    const { tuitions } = getCollections();
+
     const result = await tuitions.updateOne(
-      { _id: new ObjectId(id), tutorId: user.id },
-      { $set: updateData }
+      {
+        _id: new ObjectId(id),
+        tutorId: user.id,
+      },
+      {
+        $set: updateData,
+      }
     );
 
     if (result.matchedCount === 0) {
       res.status(404).json({
         success: false,
-        message: "Tuition not found",
+        message: "Tuition not found.",
       });
       return;
     }
 
     res.status(200).json({
       success: true,
-      message: "Tuition updated successfully",
+      message: "Tuition updated successfully.",
     });
   } catch (error) {
     next(error);
@@ -371,22 +527,21 @@ router.patch("/my-tuitions/:id", async (req, res, next) => {
 });
 
 // ==========================================
-// DELETE TUTOR'S TUITION
+// DELETE TUTOR'S OWN TUITION
 // ==========================================
 router.delete("/my-tuitions/:id", async (req, res, next) => {
   try {
-    const idParam = req.params.id;
-    const id = Array.isArray(idParam) ? idParam[0] : idParam;
+    const user = res.locals.user as TutorUser;
+    const id = getId(req.params.id);
 
     if (!id || !ObjectId.isValid(id)) {
       res.status(400).json({
         success: false,
-        message: "Invalid tuition ID",
+        message: "Invalid tuition ID.",
       });
       return;
     }
 
-    const user = res.locals.user as { id: string };
     const { tuitions } = getCollections();
 
     const result = await tuitions.deleteOne({
@@ -397,14 +552,14 @@ router.delete("/my-tuitions/:id", async (req, res, next) => {
     if (result.deletedCount === 0) {
       res.status(404).json({
         success: false,
-        message: "Tuition not found",
+        message: "Tuition not found.",
       });
       return;
     }
 
     res.status(200).json({
       success: true,
-      message: "Tuition deleted successfully",
+      message: "Tuition deleted successfully.",
     });
   } catch (error) {
     next(error);
