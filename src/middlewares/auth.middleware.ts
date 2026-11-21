@@ -13,8 +13,11 @@ interface AuthUser {
   plan: string;
 }
 
+// Always normalize the backend URL.
 const getBaseURL = () =>
-  process.env.BETTER_AUTH_URL || "http://localhost:5000";
+  (process.env.BETTER_AUTH_URL || "http://localhost:5000")
+    .trim()
+    .replace(/\/+$/, "");
 
 let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 let jwksURL = "";
@@ -60,12 +63,12 @@ export const verifyToken: RequestHandler = async (req, res, next) => {
     });
 
     const user: AuthUser = {
-  id: String(payload.id || payload.sub || ""),
-  name: String(payload.name || ""),
-  email: String(payload.email || ""),
-  role: String(payload.role || ""),
-  plan: String(payload.plan || "free"),
-};
+      id: String(payload.id || payload.sub || ""),
+      name: String(payload.name || ""),
+      email: String(payload.email || ""),
+      role: String(payload.role || ""),
+      plan: String(payload.plan || "free"),
+    };
 
     if (!user.id || !user.email || !user.role) {
       res.status(401).json({
@@ -77,7 +80,9 @@ export const verifyToken: RequestHandler = async (req, res, next) => {
 
     res.locals.user = user;
     next();
-  } catch {
+  } catch (error) {
+    console.error("JWT verification failed:", error);
+
     res.status(401).json({
       success: false,
       message: "Invalid or expired JWT token.",
