@@ -243,13 +243,13 @@ router.post("/", verifyToken, verifyTutor, async (req, res, next) => {
 
       bannerImage,
       description: String(description).trim(),
+      
+tutorId: user.id,
+tutorName: user.name || "",
+tutorEmail: user.email,
 
-      tutorName: user.name || "",
-      tutorEmail: user.email,
-
-      approvalStatus: "pending",
-      isActive: true,
-
+approvalStatus: "pending",
+isActive: true,
       createdAt: now,
     };
 

@@ -211,16 +211,39 @@ router.post("/my-tuitions", async (req, res, next) => {
   }
 });
 
+
 // ==========================================
 // GET TUTOR'S OWN TUITION POSTS
+// Supports both new and legacy tuition posts
 // ==========================================
 router.get("/my-tuitions", async (_req, res, next) => {
   try {
     const user = res.locals.user as TutorUser;
     const { tuitions } = getCollections();
 
+    if (!user?.id) {
+      res.status(401).json({
+        success: false,
+        message: "Tutor authentication information is missing.",
+      });
+      return;
+    }
+
+    // New posts use tutorId.
+    // Older posts may only contain tutorEmail.
+    const ownerFilter = user.email
+      ? {
+          $or: [
+            { tutorId: user.id },
+            { tutorEmail: user.email },
+          ],
+        }
+      : {
+          tutorId: user.id,
+        };
+
     const result = await tuitions
-      .find({ tutorId: user.id })
+      .find(ownerFilter)
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -232,6 +255,7 @@ router.get("/my-tuitions", async (_req, res, next) => {
     next(error);
   }
 });
+
 
 // ==========================================
 // TOGGLE TUITION ACTIVE / INACTIVE
