@@ -4,6 +4,7 @@ import { ObjectId } from "mongodb";
 import Stripe from "stripe";
 
 import { getDB } from "../config/db.js";
+
 import { getCollections } from "../config/collections.js";
 import { getStripe } from "../config/stripe.js";
 import { verifyToken } from "../middlewares/auth.middleware.js";
@@ -63,8 +64,10 @@ const updateUserSubscription = async (
         stripeSubscriptionId: subscriptionId,
       };
 
-  const result = await getDB().collection("user").updateOne(
-    filter,
+  const { users } = getCollections();
+
+const result = await users.updateOne(
+  filter,
     {
       $set: {
         plan: active ? "pro" : "free",
@@ -244,8 +247,8 @@ const createCheckoutSession: RequestHandler = async (
     }
 
     const dbUser = await getDB()
-      .collection("user")
-      .findOne({ _id: new ObjectId(user.id) });
+  .collection("user")
+  .findOne({ _id: new ObjectId(user.id) });
 
     if (!dbUser) {
       res.status(404).json({
