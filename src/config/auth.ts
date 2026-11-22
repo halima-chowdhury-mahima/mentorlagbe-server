@@ -21,6 +21,10 @@ if (!SECRET) {
   throw new Error("BETTER_AUTH_SECRET is missing.");
 }
 
+if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+  throw new Error("Google OAuth credentials are missing.");
+}
+
 const PRODUCTION = process.env.NODE_ENV === "production";
 
 const createAuth = () =>
@@ -48,6 +52,13 @@ const createAuth = () =>
       minPasswordLength: 8,
       maxPasswordLength: 128,
     },
+
+    socialProviders: {
+  google: {
+    clientId: process.env.GOOGLE_CLIENT_ID!,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+  },
+},
 
     user: {
       additionalFields: {
