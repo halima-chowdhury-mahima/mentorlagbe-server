@@ -1,7 +1,8 @@
-
 import { Router, type RequestHandler } from "express";
 import { ObjectId } from "mongodb";
 import Stripe from "stripe";
+
+import { getDB } from "../config/db.js";
 
 import { getCollections } from "../config/collections.js";
 import { getStripe } from "../config/stripe.js";
@@ -19,99 +20,24 @@ interface AuthUser {
 
 type ProPlan = "pro_student" | "pro_tutor";
 
-interface InvoicePaymentEntry {
-  status?: string;
-  payment?: {
-    type?: string;
-    payment_intent?: string | { id: string } | null;
-  } | null;
-}
-
 // --------------------------------------------------
 // Helpers
 // --------------------------------------------------
 
-const getStripeObjectId = (
-  value: string | { id: string } | null | undefined
-): string | null => {
-  if (!value) return null;
-
-  return typeof value === "string" ? value : value.id;
-};
-
 const getSubscriptionId = (
   session: Stripe.Checkout.Session
 ): string | null => {
-  return getStripeObjectId(session.subscription);
+  return typeof session.subscription === "string"
+    ? session.subscription
+    : session.subscription?.id ?? null;
 };
 
-const getErrorMessage = (error: unknown): string => {
-  return error instanceof Error ? error.message : "Unknown error.";
-};
-
-// --------------------------------------------------
-// Get PaymentIntent from a paid invoice
-// Stripe SDK v23 invoice payments structure
-// --------------------------------------------------
-
-const getPaymentIntentFromInvoice = async (
-  invoiceId: string
-): Promise<string | null> => {
-  const stripe = getStripe();
-
-  const invoice = await stripe.invoices.retrieve(invoiceId, {
-    expand: ["payments.data.payment.payment_intent"],
-  });
-
-  const invoiceWithPayments = invoice as unknown as {
-    payments?: {
-      data?: InvoicePaymentEntry[];
-    };
-  };
-
-  const payments = invoiceWithPayments.payments?.data ?? [];
-
-  const paidPayment = payments.find(
-    (item) =>
-      item.status === "paid" &&
-      item.payment?.type === "payment_intent"
-  );
-
-  const paymentIntent = paidPayment?.payment?.payment_intent;
-
-  if (!paymentIntent) {
-    return null;
-  }
-
-  return typeof paymentIntent === "string"
-    ? paymentIntent
-    : paymentIntent.id;
-};
-
-// --------------------------------------------------
-// Get initial PaymentIntent from subscription
-// --------------------------------------------------
-
-const getSubscriptionPaymentIntentId = async (
-  subscriptionId: string,
-  checkoutInvoiceId?: string | null
-): Promise<string | null> => {
-  let invoiceId = checkoutInvoiceId ?? null;
-
-  if (!invoiceId) {
-    const stripe = getStripe();
-
-    const subscription =
-      await stripe.subscriptions.retrieve(subscriptionId);
-
-    invoiceId = getStripeObjectId(subscription.latest_invoice);
-  }
-
-  if (!invoiceId) {
-    return null;
-  }
-
-  return getPaymentIntentFromInvoice(invoiceId);
+const getPaymentIntentId = (
+  session: Stripe.Checkout.Session
+): string | null => {
+  return typeof session.payment_intent === "string"
+    ? session.payment_intent
+    : session.payment_intent?.id ?? null;
 };
 
 // --------------------------------------------------
@@ -123,13 +49,12 @@ const updateUserSubscription = async (
   subscriptionId: string,
   status: Stripe.Subscription.Status,
   allowReplace = false
-): Promise<boolean> => {
+): Promise<void> => {
   if (!ObjectId.isValid(userId)) {
     throw new Error("Invalid user ID.");
   }
 
-  const active =
-    status === "active" || status === "trialing";
+  const active = status === "active" || status === "trialing";
 
   const filter = allowReplace
     ? { _id: new ObjectId(userId) }
@@ -140,33 +65,27 @@ const updateUserSubscription = async (
 
   const { users } = getCollections();
 
-  const result = await users.updateOne(filter, {
-    $set: {
-      plan: active ? "pro" : "free",
-      stripeSubscriptionId: subscriptionId,
-      subscriptionStatus: status,
-      updatedAt: new Date(),
-    },
-  });
-
-  if (result.matchedCount === 0) {
-    console.error(
-      `Subscription update failed: user=${userId}, subscription=${subscriptionId}`
-    );
-
-    return false;
-  }
-
-  console.log(
-    `Subscription updated: user=${userId}, plan=${active ? "pro" : "free"}`
+const result = await users.updateOne(
+  filter,
+    {
+      $set: {
+        plan: active ? "pro" : "free",
+        stripeSubscriptionId: subscriptionId,
+        subscriptionStatus: status,
+        updatedAt: new Date(),
+      },
+    }
   );
 
-  return true;
+  if (result.matchedCount === 0) {
+    console.log(
+      `Subscription update skipped: user=${userId}, subscription=${subscriptionId}`
+    );
+  }
 };
 
 // --------------------------------------------------
 // Save payment record once
-// Also updates missing PaymentIntent on old records
 // --------------------------------------------------
 
 const savePaymentRecord = async (
@@ -174,7 +93,11 @@ const savePaymentRecord = async (
 ): Promise<void> => {
   const metadata = session.metadata;
 
-  if (!metadata?.userId || !metadata?.role || !metadata?.plan) {
+  if (
+    !metadata?.userId ||
+    !metadata?.role ||
+    !metadata?.plan
+  ) {
     throw new Error("Payment metadata is incomplete.");
   }
 
@@ -183,29 +106,7 @@ const savePaymentRecord = async (
     session.status !== "complete" ||
     session.payment_status !== "paid"
   ) {
-    throw new Error(
-      "Checkout session is not a completed paid subscription."
-    );
-  }
-
-  const subscriptionId = getSubscriptionId(session);
-
-  if (!subscriptionId) {
-    throw new Error("Stripe subscription ID is missing.");
-  }
-
-  const checkoutInvoiceId = getStripeObjectId(session.invoice);
-
-  const paymentIntentId =
-    await getSubscriptionPaymentIntentId(
-      subscriptionId,
-      checkoutInvoiceId
-    );
-
-  if (!paymentIntentId) {
-    throw new Error(
-      "Could not find the PaymentIntent for the paid subscription invoice."
-    );
+    throw new Error("Checkout session is not a completed paid subscription.");
   }
 
   const { payments } = getCollections();
@@ -218,71 +119,56 @@ const savePaymentRecord = async (
     }
   );
 
-  const now = new Date();
+  const subscriptionId = getSubscriptionId(session);
+  const paymentIntentId = getPaymentIntentId(session);
 
   const paymentRecord = {
     userId: metadata.userId,
-
-    userEmail:
-      metadata.userEmail ||
-      session.customer_details?.email ||
-      "",
-
-    userName:
-      metadata.userName ||
-      session.customer_details?.name ||
-      "",
-
+    userEmail: metadata.userEmail || session.customer_details?.email || "",
+    userName: metadata.userName || session.customer_details?.name || "",
     userRole: metadata.role,
     role: metadata.role,
-
     plan: metadata.plan,
-
     planName:
       metadata.plan === "pro_tutor"
         ? "Tutor PRO"
         : "Student PRO",
-
     amount: (session.amount_total ?? 0) / 100,
-
     currency: session.currency?.toUpperCase() ?? "USD",
-
+    transactionId: paymentIntentId || session.id,
+    stripeSessionId: session.id,
+    stripeSubscriptionId: subscriptionId,
+    stripePaymentIntentId: paymentIntentId,
+    subscriptionId,
+    paymentIntentId,
     paymentStatus: "paid",
     status: "paid",
-
-    approvalStatus: "pending",
-    refundStatus: null,
-
     method: "stripe",
-    subscriptionCanceled: false,
-
-    paidAt: now,
-    createdAt: now,
+    paidAt: new Date(),
+    createdAt: new Date(),
+    updatedAt: new Date(),
   };
 
-  await payments.updateOne(
-    { stripeSessionId: session.id },
-    {
-      // Always update these fields.
-      // This also repairs old records with empty PaymentIntent IDs.
-      $set: {
-        transactionId: paymentIntentId,
-        stripeSubscriptionId: subscriptionId,
-        stripePaymentIntentId: paymentIntentId,
-        subscriptionId,
-        paymentIntentId,
-        updatedAt: now,
+  try {
+    await payments.updateOne(
+      { stripeSessionId: session.id },
+      {
+        $setOnInsert: paymentRecord,
       },
+      { upsert: true }
+    );
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === 11000
+    ) {
+      return;
+    }
 
-      // Only create the remaining fields for a new record.
-      $setOnInsert: paymentRecord,
-    },
-    { upsert: true }
-  );
-
-  console.log(
-    `Payment record saved: session=${session.id}, paymentIntent=${paymentIntentId}`
-  );
+    throw error;
+  }
 };
 
 // --------------------------------------------------
@@ -295,7 +181,6 @@ const validateCheckoutPlan: RequestHandler = (
   next
 ) => {
   const user = res.locals.user as AuthUser | undefined;
-
   const requestedPlan = req.body?.plan;
 
   if (!user) {
@@ -360,11 +245,9 @@ const createCheckoutSession: RequestHandler = async (
       return;
     }
 
-    const { users } = getCollections();
-
-    const dbUser = await users.findOne({
-      _id: new ObjectId(user.id),
-    });
+    const dbUser = await getDB()
+  .collection("user")
+  .findOne({ _id: new ObjectId(user.id) });
 
     if (!dbUser) {
       res.status(404).json({
@@ -392,30 +275,18 @@ const createCheckoutSession: RequestHandler = async (
 
     const stripe = getStripe();
 
-    const clientURL = (process.env.CLIENT_URL || "")
-      .split(",")[0]
-      .trim()
-      .replace(/\/$/, "");
+    const clientURL = (
+      process.env.CLIENT_URL || ""
+    ).split(",")[0].trim().replace(/\/$/, "");
 
     if (!clientURL) {
       throw new Error("CLIENT_URL is missing.");
     }
 
-    const userName = user.name || dbUser.name || "";
-    const userEmail = user.email || dbUser.email || "";
-
-    if (!userEmail) {
-      res.status(400).json({
-        success: false,
-        message: "Your account email is required for checkout.",
-      });
-      return;
-    }
-
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
 
-      customer_email: userEmail,
+      customer_email: user.email || dbUser.email,
 
       client_reference_id: user.id,
 
@@ -423,23 +294,17 @@ const createCheckoutSession: RequestHandler = async (
         {
           price_data: {
             currency: "usd",
-
             product_data: {
               name: isTutor
                 ? "MentorLagbe Pro Tutor"
                 : "MentorLagbe Pro Student",
-
-              description:
-                "MentorLagbe monthly Pro subscription",
+              description: "MentorLagbe monthly Pro subscription",
             },
-
             unit_amount: amount,
-
             recurring: {
               interval: "month",
             },
           },
-
           quantity: 1,
         },
       ],
@@ -449,8 +314,8 @@ const createCheckoutSession: RequestHandler = async (
           userId: user.id,
           role: user.role,
           plan,
-          userName,
-          userEmail,
+          userName: user.name || dbUser.name || "",
+          userEmail: user.email || dbUser.email || "",
         },
       },
 
@@ -458,12 +323,11 @@ const createCheckoutSession: RequestHandler = async (
         userId: user.id,
         role: user.role,
         plan,
-        userName,
-        userEmail,
+        userName: user.name || dbUser.name || "",
+        userEmail: user.email || dbUser.email || "",
       },
 
-      success_url:
-        `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
 
       cancel_url: `${clientURL}/payment/cancel`,
     });
@@ -531,7 +395,10 @@ const verifyCheckoutSession: RequestHandler = async (
       return;
     }
 
-    if (user.role !== "student" && user.role !== "tutor") {
+    if (
+      user.role !== "student" &&
+      user.role !== "tutor"
+    ) {
       res.status(403).json({
         success: false,
         message: "Invalid account role.",
@@ -596,26 +463,14 @@ const verifyCheckoutSession: RequestHandler = async (
       return;
     }
 
-    // Save the verified payment before activating Pro.
-    // If the invoice PaymentIntent cannot be found,
-    // the account will not be activated accidentally.
-    await savePaymentRecord(session);
-
-    const updated = await updateUserSubscription(
+    await updateUserSubscription(
       user.id,
       subscription.id,
       subscription.status,
       true
     );
 
-    if (!updated) {
-      res.status(500).json({
-        success: false,
-        message:
-          "Payment verified, but your Pro plan could not be activated. Please contact support.",
-      });
-      return;
-    }
+    await savePaymentRecord(session);
 
     res.status(200).json({
       success: true,
@@ -637,7 +492,6 @@ const stripeWebhook: RequestHandler = async (
   res
 ) => {
   const signature = req.headers["stripe-signature"];
-
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!webhookSecret) {
@@ -666,15 +520,8 @@ const stripeWebhook: RequestHandler = async (
       webhookSecret
     );
   } catch (error) {
-    console.error(
-      "Stripe webhook signature error:",
-      error
-    );
-
-    res.status(400).send(
-      "Invalid Stripe webhook signature."
-    );
-
+    console.error("Stripe webhook signature error:", error);
+    res.status(400).send("Invalid Stripe webhook signature.");
     return;
   }
 
@@ -687,11 +534,9 @@ const stripeWebhook: RequestHandler = async (
 
         if (
           session.payment_status === "paid" &&
-          session.status === "complete" &&
-          session.mode === "subscription"
+          session.status === "complete"
         ) {
-          const subscriptionId =
-            getSubscriptionId(session);
+          const subscriptionId = getSubscriptionId(session);
 
           if (!subscriptionId) {
             throw new Error("Subscription ID not found.");
@@ -705,22 +550,17 @@ const stripeWebhook: RequestHandler = async (
           if (
             userId &&
             subscription.metadata.userId === userId &&
-            subscription.metadata.role === session.metadata?.role &&
-            subscription.metadata.plan === session.metadata?.plan &&
-            (
-              subscription.status === "active" ||
-              subscription.status === "trialing"
-            )
+            (subscription.status === "active" ||
+              subscription.status === "trialing")
           ) {
-            // Save payment first.
-            await savePaymentRecord(session);
-
             await updateUserSubscription(
               userId,
               subscription.id,
               subscription.status,
               true
             );
+
+            await savePaymentRecord(session);
           }
         }
 
@@ -769,10 +609,7 @@ const stripeWebhook: RequestHandler = async (
       received: true,
     });
   } catch (error) {
-    console.error(
-      "Stripe webhook processing failed:",
-      error
-    );
+    console.error("Stripe webhook processing failed:", error);
 
     res.status(500).json({
       success: false,
@@ -810,315 +647,10 @@ const getMyPayments: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// Admin: Get all payment records
-// --------------------------------------------------
-
-const getAllPayments: RequestHandler = async (
-  _req,
-  res,
-  next
-) => {
-  try {
-    const user = res.locals.user as AuthUser;
-
-    if (user.role !== "admin") {
-      res.status(403).json({
-        success: false,
-        message: "Admin access required.",
-      });
-      return;
-    }
-
-    const { payments } = getCollections();
-
-    const records = await payments
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.status(200).json({
-      success: true,
-      total: records.length,
-      payments: records,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// --------------------------------------------------
-// Admin: Reject payment, cancel subscription & refund
-// --------------------------------------------------
-
-const rejectPayment: RequestHandler = async (
-  req,
-  res,
-  next
-) => {
-  try {
-    const user = res.locals.user as AuthUser;
-
-    if (user.role !== "admin") {
-      res.status(403).json({
-        success: false,
-        message: "Admin access required.",
-      });
-      return;
-    }
-
-    const paymentIdParam = req.params.paymentId;
-
-    const paymentId = Array.isArray(paymentIdParam)
-      ? paymentIdParam[0]
-      : paymentIdParam;
-
-    if (!paymentId || !ObjectId.isValid(paymentId)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid payment ID.",
-      });
-      return;
-    }
-
-    const { payments } = getCollections();
-
-    const payment = await payments.findOne({
-      _id: new ObjectId(paymentId),
-    });
-
-    if (!payment) {
-      res.status(404).json({
-        success: false,
-        message: "Payment record not found.",
-      });
-      return;
-    }
-
-    if (payment.approvalStatus === "approved") {
-      res.status(400).json({
-        success: false,
-        message: "This payment has already been approved.",
-      });
-      return;
-    }
-
-    if (payment.refundStatus === "succeeded") {
-      res.status(200).json({
-        success: true,
-        message: "This payment has already been refunded.",
-        refundStatus: "succeeded",
-      });
-      return;
-    }
-
-    if (
-      payment.status !== "paid" &&
-      payment.paymentStatus !== "paid"
-    ) {
-      res.status(400).json({
-        success: false,
-        message:
-          "Only successful payments can be rejected and refunded.",
-      });
-      return;
-    }
-
-    const subscriptionId =
-      payment.stripeSubscriptionId ||
-      payment.subscriptionId;
-
-    if (!subscriptionId) {
-      res.status(400).json({
-        success: false,
-        message: "Stripe subscription information is missing.",
-      });
-      return;
-    }
-
-    const stripe = getStripe();
-
-    // Retrieve the subscription first.
-    const subscription =
-      await stripe.subscriptions.retrieve(subscriptionId);
-
-    // Verify subscription ownership when metadata is available.
-    if (
-      subscription.metadata.userId &&
-      subscription.metadata.userId !== payment.userId
-    ) {
-      res.status(403).json({
-        success: false,
-        message:
-          "Subscription does not belong to this payment record.",
-      });
-      return;
-    }
-
-    // Use stored PaymentIntent, or recover it from the invoice.
-    let paymentIntentId =
-      payment.stripePaymentIntentId ||
-      payment.paymentIntentId ||
-      null;
-
-    if (!paymentIntentId) {
-      paymentIntentId =
-        await getSubscriptionPaymentIntentId(subscriptionId);
-    }
-
-    if (!paymentIntentId) {
-      res.status(400).json({
-        success: false,
-        message:
-          "Could not find the initial Stripe PaymentIntent. No refund was attempted.",
-      });
-      return;
-    }
-
-    // Save recovered PaymentIntent before continuing.
-    await payments.updateOne(
-      { _id: new ObjectId(paymentId) },
-      {
-        $set: {
-          stripePaymentIntentId: paymentIntentId,
-          paymentIntentId,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    // Mark rejection and refund processing.
-    await payments.updateOne(
-      { _id: new ObjectId(paymentId) },
-      {
-        $set: {
-          approvalStatus: "rejected",
-          refundStatus: "pending",
-          refundError: null,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    try {
-      // Cancel subscription first.
-      if (subscription.status !== "canceled") {
-        await stripe.subscriptions.cancel(subscriptionId);
-      }
-
-      await payments.updateOne(
-        { _id: new ObjectId(paymentId) },
-        {
-          $set: {
-            subscriptionCanceled: true,
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      // Downgrade user's Pro plan.
-      const userUpdated = await updateUserSubscription(
-        payment.userId,
-        subscriptionId,
-        "canceled",
-        true
-      );
-
-      if (!userUpdated) {
-        console.error(
-          `Could not downgrade user ${payment.userId} after subscription cancellation.`
-        );
-      }
-
-      // Refund the initial payment.
-      const refund = await stripe.refunds.create(
-        {
-          payment_intent: paymentIntentId,
-
-          reason: "requested_by_customer",
-
-          metadata: {
-            paymentId,
-            userId: payment.userId,
-            rejectedBy: user.id,
-          },
-        },
-        {
-          idempotencyKey:
-            `mentorlagbe-refund-${paymentId}`,
-        }
-      );
-
-      const refundSucceeded =
-        refund.status === "succeeded";
-
-      await payments.updateOne(
-        { _id: new ObjectId(paymentId) },
-        {
-          $set: {
-            approvalStatus: "rejected",
-
-            refundStatus: refundSucceeded
-              ? "succeeded"
-              : "pending",
-
-            refundId: refund.id,
-            refundError: null,
-
-            status: refundSucceeded
-              ? "refunded"
-              : "paid",
-
-            paymentStatus: refundSucceeded
-              ? "refunded"
-              : "paid",
-
-            subscriptionCanceled: true,
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      res.status(200).json({
-        success: true,
-
-        message: refundSucceeded
-          ? "Payment rejected, subscription canceled, and refund completed."
-          : "Payment rejected and subscription canceled. Refund is still processing.",
-
-        approvalStatus: "rejected",
-        subscriptionCanceled: true,
-
-        refundStatus: refundSucceeded
-          ? "succeeded"
-          : "pending",
-
-        refundId: refund.id,
-      });
-    } catch (error) {
-      await payments.updateOne(
-        { _id: new ObjectId(paymentId) },
-        {
-          $set: {
-            approvalStatus: "rejected",
-            refundStatus: "failed",
-            refundError: getErrorMessage(error),
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      throw error;
-    }
-  } catch (error) {
-    next(error);
-  }
-};
-
-// --------------------------------------------------
 // Routes
 // --------------------------------------------------
 
-// Student and Tutor: Create Pro checkout
+// Common PRO checkout endpoint for Student and Tutor
 router.post(
   "/create-checkout-session",
   verifyToken,
@@ -1126,33 +658,20 @@ router.post(
   createCheckoutSession
 );
 
-// Student and Tutor: Verify payment
+// Verify payment
 router.post(
   "/verify-session",
   verifyToken,
   verifyCheckoutSession
 );
 
-// Logged-in user: Own payment history
+// Logged-in user's payment history
 router.get(
   "/my-payments",
   verifyToken,
   getMyPayments
 );
 
-// Admin: All payment records
-router.get(
-  "/admin/all",
-  verifyToken,
-  getAllPayments
-);
-
-// Admin: Reject payment + cancel subscription + refund
-router.patch(
-  "/admin/:paymentId/reject",
-  verifyToken,
-  rejectPayment
-);
 
 // Stripe webhook
 router.post(
