@@ -37,7 +37,7 @@ interface InvoiceWithPayments {
 }
 
 // --------------------------------------------------
-// Helpers
+// HELPERS
 // --------------------------------------------------
 
 const getSubscriptionId = (
@@ -56,7 +56,6 @@ const getSessionInvoiceId = (
     : session.invoice?.id ?? null;
 };
 
-// Get PaymentIntent from an invoice
 const getPaymentIntentFromInvoice = async (
   stripe: Stripe,
   invoiceId: string
@@ -68,16 +67,12 @@ const getPaymentIntentFromInvoice = async (
   const invoiceWithPayments =
     invoice as unknown as InvoiceWithPayments;
 
-  const entries = invoiceWithPayments.payments?.data ?? [];
+  for (const entry of invoiceWithPayments.payments?.data ?? []) {
+    const intent = entry.payment?.payment_intent;
 
-  for (const entry of entries) {
-    const payment = entry.payment;
-
-    if (payment?.type !== "payment_intent") {
+    if (entry.payment?.type !== "payment_intent") {
       continue;
     }
-
-    const intent = payment.payment_intent;
 
     if (typeof intent === "string") {
       return intent;
@@ -91,7 +86,6 @@ const getPaymentIntentFromInvoice = async (
   return null;
 };
 
-// Get the initial subscription PaymentIntent
 const getInitialPaymentIntentId = async (
   stripe: Stripe,
   session: Stripe.Checkout.Session
@@ -108,24 +102,22 @@ const getInitialPaymentIntentId = async (
   const invoiceId = getSessionInvoiceId(session);
 
   if (invoiceId) {
-    const paymentIntentId =
-      await getPaymentIntentFromInvoice(stripe, invoiceId);
+    const intentId = await getPaymentIntentFromInvoice(
+      stripe,
+      invoiceId
+    );
 
-    if (paymentIntentId) {
-      return paymentIntentId;
-    }
+    if (intentId) return intentId;
   }
 
   const subscriptionId = getSubscriptionId(session);
 
-  if (!subscriptionId) {
-    return null;
-  }
+  if (!subscriptionId) return null;
 
-  const subscription =
-    await stripe.subscriptions.retrieve(subscriptionId, {
-      expand: ["latest_invoice"],
-    });
+  const subscription = await stripe.subscriptions.retrieve(
+    subscriptionId,
+    { expand: ["latest_invoice"] }
+  );
 
   const latestInvoice = subscription.latest_invoice;
 
@@ -134,17 +126,13 @@ const getInitialPaymentIntentId = async (
       ? latestInvoice
       : latestInvoice?.id ?? null;
 
-  if (!latestInvoiceId) {
-    return null;
-  }
+  if (!latestInvoiceId) return null;
 
   return getPaymentIntentFromInvoice(stripe, latestInvoiceId);
 };
 
-// --------------------------------------------------
-// Update user subscription
-// --------------------------------------------------
-
+// Update both Better Auth's "user" collection and the
+// application's "users" collection.
 const updateUserSubscription = async (
   userId: string,
   subscriptionId: string,
@@ -158,34 +146,46 @@ const updateUserSubscription = async (
   const active =
     status === "active" || status === "trialing";
 
+  const userIdObject = new ObjectId(userId);
+
   const filter = allowReplace
-    ? { _id: new ObjectId(userId) }
+    ? { _id: userIdObject }
     : {
-        _id: new ObjectId(userId),
+        _id: userIdObject,
         stripeSubscriptionId: subscriptionId,
       };
 
-  const { users } = getCollections();
-
-  const result = await users.updateOne(filter, {
+  const update = {
     $set: {
       plan: active ? "pro" : "free",
       stripeSubscriptionId: subscriptionId,
       subscriptionStatus: status,
       updatedAt: new Date(),
     },
-  });
+  };
 
-  if (result.matchedCount === 0) {
-    console.log(
+  const db = getDB();
+  const { users } = getCollections();
+
+  const results = await Promise.all([
+    db.collection("user").updateOne(filter, update),
+    users.updateOne(filter, update),
+  ]);
+
+  if (
+    results[0].matchedCount === 0 &&
+    results[1].matchedCount === 0
+  ) {
+    console.warn(
       `Subscription update skipped: user=${userId}, subscription=${subscriptionId}`
     );
   }
 };
 
 // --------------------------------------------------
-// Save payment record once
+// SAVE PAYMENT RECORD
 // --------------------------------------------------
+
 
 const savePaymentRecord = async (
   session: Stripe.Checkout.Session
@@ -210,32 +210,30 @@ const savePaymentRecord = async (
     );
   }
 
-  const stripe = getStripe();
-
   const subscriptionId = getSubscriptionId(session);
 
   if (!subscriptionId) {
     throw new Error("Subscription ID not found.");
   }
 
-  const paymentIntentId =
-    await getInitialPaymentIntentId(stripe, session);
+  const stripe = getStripe();
 
-  if (!paymentIntentId) {
-    throw new Error(
-      "Initial Stripe PaymentIntent could not be found."
+  let paymentIntentId: string | null = null;
+
+  try {
+    paymentIntentId = await getInitialPaymentIntentId(
+      stripe,
+      session
+    );
+  } catch (error) {
+    console.error(
+      "Could not retrieve initial PaymentIntent:",
+      error
     );
   }
 
   const { payments } = getCollections();
-
-  await payments.createIndex(
-    { stripeSessionId: 1 },
-    {
-      unique: true,
-      name: "unique_stripe_session_id",
-    }
-  );
+  const now = new Date();
 
   const paymentRecord = {
     userId: metadata.userId,
@@ -244,6 +242,14 @@ const savePaymentRecord = async (
       session.customer_details?.email ||
       "",
     userName:
+      metadata.userName ||
+      session.customer_details?.name ||
+      "",
+    email:
+      metadata.userEmail ||
+      session.customer_details?.email ||
+      "",
+    name:
       metadata.userName ||
       session.customer_details?.name ||
       "",
@@ -256,7 +262,7 @@ const savePaymentRecord = async (
         : "Student PRO",
     amount: (session.amount_total ?? 0) / 100,
     currency: session.currency?.toUpperCase() ?? "USD",
-    transactionId: paymentIntentId,
+    transactionId: paymentIntentId || session.id,
     stripeSessionId: session.id,
     stripeSubscriptionId: subscriptionId,
     stripePaymentIntentId: paymentIntentId,
@@ -266,35 +272,51 @@ const savePaymentRecord = async (
     status: "paid",
     method: "stripe",
     refundStatus: "not_refunded",
-    paidAt: new Date(),
-    createdAt: new Date(),
-    updatedAt: new Date(),
+    cancellationStatus: "not_cancelled",
+    paidAt: session.created
+      ? new Date(session.created * 1000)
+      : now,
+    updatedAt: now,
   };
 
   try {
     await payments.updateOne(
       { stripeSessionId: session.id },
       {
-        $setOnInsert: paymentRecord,
+        $set: paymentRecord,
+        $setOnInsert: {
+          createdAt: now,
+        },
       },
       { upsert: true }
     );
   } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === 11000
-    ) {
-      return;
+    // If webhook and verification run simultaneously,
+    // the unique index may reject the second insert.
+    const mongoError = error as { code?: number };
+
+    if (mongoError.code !== 11000) {
+      throw error;
     }
 
-    throw error;
+    await payments.updateOne(
+      { stripeSessionId: session.id },
+      {
+        $set: paymentRecord,
+      }
+    );
+  }
+
+  if (!paymentIntentId) {
+    console.warn(
+      `Payment saved without PaymentIntent: session=${session.id}`
+    );
   }
 };
 
+
 // --------------------------------------------------
-// Validate checkout plan
+// VALIDATE CHECKOUT PLAN
 // --------------------------------------------------
 
 const validateCheckoutPlan: RequestHandler = (
@@ -331,8 +353,7 @@ const validateCheckoutPlan: RequestHandler = (
   if (requestedPlan !== expectedPlan) {
     res.status(400).json({
       success: false,
-      message:
-        "Selected plan does not match your account role.",
+      message: "Selected plan does not match your account role.",
     });
     return;
   }
@@ -341,7 +362,7 @@ const validateCheckoutPlan: RequestHandler = (
 };
 
 // --------------------------------------------------
-// Create monthly Stripe subscription checkout
+// CREATE CHECKOUT SESSION
 // --------------------------------------------------
 
 const createCheckoutSession: RequestHandler = async (
@@ -358,8 +379,7 @@ const createCheckoutSession: RequestHandler = async (
     ) {
       res.status(403).json({
         success: false,
-        message:
-          "Only students and tutors can purchase Pro.",
+        message: "Only students and tutors can purchase Pro.",
       });
       return;
     }
@@ -384,7 +404,12 @@ const createCheckoutSession: RequestHandler = async (
       return;
     }
 
-    if (dbUser.plan === "pro") {
+    if (
+      dbUser.plan === "pro" &&
+      ["active", "trialing"].includes(
+        String(dbUser.subscriptionStatus || "")
+      )
+    ) {
       res.status(400).json({
         success: false,
         message: "You already have an active Pro plan.",
@@ -398,9 +423,8 @@ const createCheckoutSession: RequestHandler = async (
       ? "pro_tutor"
       : "pro_student";
 
+    // Amounts are in cents: $15 and $10.
     const amount = isTutor ? 1500 : 1000;
-
-    const stripe = getStripe();
 
     const clientURL = (
       process.env.CLIENT_URL || ""
@@ -413,68 +437,60 @@ const createCheckoutSession: RequestHandler = async (
       throw new Error("CLIENT_URL is missing.");
     }
 
-    const session =
-      await stripe.checkout.sessions.create({
-        mode: "subscription",
+    const stripe = getStripe();
 
-        customer_email:
-          user.email || dbUser.email,
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: user.email || dbUser.email,
+      client_reference_id: user.id,
 
-        client_reference_id: user.id,
-
-        line_items: [
-          {
-            price_data: {
-              currency: "usd",
-              product_data: {
-                name: isTutor
-                  ? "MentorLagbe Pro Tutor"
-                  : "MentorLagbe Pro Student",
-                description:
-                  "MentorLagbe monthly Pro subscription",
-              },
-              unit_amount: amount,
-              recurring: {
-                interval: "month",
-              },
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: isTutor
+                ? "MentorLagbe Pro Tutor"
+                : "MentorLagbe Pro Student",
+              description:
+                "MentorLagbe monthly Pro subscription",
             },
-            quantity: 1,
+            unit_amount: amount,
+            recurring: {
+              interval: "month",
+            },
           },
-        ],
-
-        subscription_data: {
-          metadata: {
-            userId: user.id,
-            role: user.role,
-            plan,
-            userName:
-              user.name || dbUser.name || "",
-            userEmail:
-              user.email || dbUser.email || "",
-          },
+          quantity: 1,
         },
+      ],
 
+      subscription_data: {
         metadata: {
           userId: user.id,
           role: user.role,
           plan,
-          userName:
-            user.name || dbUser.name || "",
-          userEmail:
-            user.email || dbUser.email || "",
+          userName: user.name || dbUser.name || "",
+          userEmail: user.email || dbUser.email || "",
         },
+      },
 
-        success_url:
-          `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      metadata: {
+        userId: user.id,
+        role: user.role,
+        plan,
+        userName: user.name || dbUser.name || "",
+        userEmail: user.email || dbUser.email || "",
+      },
 
-        cancel_url:
-          `${clientURL}/payment/cancel`,
-      });
+      success_url:
+        `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+
+      cancel_url: `${clientURL}/payment/cancel`,
+    });
 
     res.status(200).json({
       success: true,
-      message:
-        "Subscription checkout created successfully.",
+      message: "Subscription checkout created successfully.",
       url: session.url,
     });
   } catch (error) {
@@ -483,7 +499,7 @@ const createCheckoutSession: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// Verify checkout session
+// VERIFY CHECKOUT SESSION
 // --------------------------------------------------
 
 const verifyCheckoutSession: RequestHandler = async (
@@ -518,8 +534,7 @@ const verifyCheckoutSession: RequestHandler = async (
     ) {
       res.status(400).json({
         success: false,
-        message:
-          "Subscription checkout is not completed.",
+        message: "Subscription checkout is not completed.",
       });
       return;
     }
@@ -569,8 +584,7 @@ const verifyCheckoutSession: RequestHandler = async (
       return;
     }
 
-    const subscriptionId =
-      getSubscriptionId(session);
+    const subscriptionId = getSubscriptionId(session);
 
     if (!subscriptionId) {
       res.status(400).json({
@@ -607,7 +621,6 @@ const verifyCheckoutSession: RequestHandler = async (
       return;
     }
 
-    // Save payment before activating the user's Pro plan.
     await savePaymentRecord(session);
 
     await updateUserSubscription(
@@ -630,37 +643,28 @@ const verifyCheckoutSession: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// Stripe webhook
+// STRIPE WEBHOOK
 // --------------------------------------------------
 
 const stripeWebhook: RequestHandler = async (
   req,
   res
 ) => {
-  const signature =
-    req.headers["stripe-signature"];
-
-  const webhookSecret =
-    process.env.STRIPE_WEBHOOK_SECRET;
+  const signature = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!webhookSecret) {
-    res.status(500).send(
-      "Stripe webhook secret is missing."
-    );
+    res.status(500).send("Stripe webhook secret is missing.");
     return;
   }
 
   if (typeof signature !== "string") {
-    res.status(400).send(
-      "Missing Stripe signature."
-    );
+    res.status(400).send("Missing Stripe signature.");
     return;
   }
 
   if (!Buffer.isBuffer(req.body)) {
-    res.status(400).send(
-      "Invalid webhook request body."
-    );
+    res.status(400).send("Invalid webhook request body.");
     return;
   }
 
@@ -675,14 +679,8 @@ const stripeWebhook: RequestHandler = async (
       webhookSecret
     );
   } catch (error) {
-    console.error(
-      "Stripe webhook signature error:",
-      error
-    );
-
-    res.status(400).send(
-      "Invalid Stripe webhook signature."
-    );
+    console.error("Stripe webhook signature error:", error);
+    res.status(400).send("Invalid Stripe webhook signature.");
     return;
   }
 
@@ -697,22 +695,16 @@ const stripeWebhook: RequestHandler = async (
           session.payment_status === "paid" &&
           session.status === "complete"
         ) {
-          const subscriptionId =
-            getSubscriptionId(session);
+          const subscriptionId = getSubscriptionId(session);
 
           if (!subscriptionId) {
-            throw new Error(
-              "Subscription ID not found."
-            );
+            throw new Error("Subscription ID not found.");
           }
 
           const subscription =
-            await stripe.subscriptions.retrieve(
-              subscriptionId
-            );
+            await stripe.subscriptions.retrieve(subscriptionId);
 
-          const userId =
-            session.metadata?.userId;
+          const userId = session.metadata?.userId;
 
           if (
             userId &&
@@ -734,12 +726,12 @@ const stripeWebhook: RequestHandler = async (
         break;
       }
 
-      case "customer.subscription.updated": {
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
         const subscription =
           event.data.object as Stripe.Subscription;
 
-        const userId =
-          subscription.metadata.userId;
+        const userId = subscription.metadata.userId;
 
         if (userId) {
           await updateUserSubscription(
@@ -752,36 +744,13 @@ const stripeWebhook: RequestHandler = async (
         break;
       }
 
-      case "customer.subscription.deleted": {
-        const subscription =
-          event.data.object as Stripe.Subscription;
-
-        const userId =
-          subscription.metadata.userId;
-
-        if (userId) {
-          await updateUserSubscription(
-            userId,
-            subscription.id,
-            "canceled"
-          );
-        }
-
-        break;
-      }
-
       default:
         break;
     }
 
-    res.status(200).json({
-      received: true,
-    });
+    res.status(200).json({ received: true });
   } catch (error) {
-    console.error(
-      "Stripe webhook processing failed:",
-      error
-    );
+    console.error("Stripe webhook processing failed:", error);
 
     res.status(500).json({
       success: false,
@@ -791,7 +760,7 @@ const stripeWebhook: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// Get logged-in user's payment history
+// USER: GET MY PAYMENTS
 // --------------------------------------------------
 
 const getMyPayments: RequestHandler = async (
@@ -801,7 +770,6 @@ const getMyPayments: RequestHandler = async (
 ) => {
   try {
     const user = res.locals.user as AuthUser;
-
     const { payments } = getCollections();
 
     const records = await payments
@@ -811,6 +779,7 @@ const getMyPayments: RequestHandler = async (
 
     res.status(200).json({
       success: true,
+      total: records.length,
       payments: records,
     });
   } catch (error) {
@@ -819,7 +788,7 @@ const getMyPayments: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// Admin: Get all Pro subscription payments
+// ADMIN: GET ALL PRO PAYMENTS
 // --------------------------------------------------
 
 const getAllPayments: RequestHandler = async (
@@ -832,6 +801,7 @@ const getAllPayments: RequestHandler = async (
 
     const records = await payments
       .find({
+        method: "stripe",
         $or: [
           { plan: "pro_student" },
           { plan: "pro_tutor" },
@@ -853,7 +823,7 @@ const getAllPayments: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// Admin: Reject payment, cancel subscription, refund
+// ADMIN: CANCEL SUBSCRIPTION + REFUND PAYMENT
 // --------------------------------------------------
 
 const rejectPayment: RequestHandler = async (
@@ -864,16 +834,16 @@ const rejectPayment: RequestHandler = async (
   try {
     const paymentId = req.params.paymentId;
 
-if (
-  typeof paymentId !== "string" ||
-  !ObjectId.isValid(paymentId)
-) {
-  res.status(400).json({
-    success: false,
-    message: "Invalid payment ID.",
-  });
-  return;
-}
+    if (
+      typeof paymentId !== "string" ||
+      !ObjectId.isValid(paymentId)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid payment ID.",
+      });
+      return;
+    }
 
     const { payments } = getCollections();
 
@@ -889,7 +859,10 @@ if (
       return;
     }
 
-    if (payment.paymentStatus === "refunded") {
+    if (
+      payment.refundStatus === "succeeded" ||
+      payment.paymentStatus === "refunded"
+    ) {
       res.status(200).json({
         success: true,
         message: "This payment has already been refunded.",
@@ -898,11 +871,15 @@ if (
       return;
     }
 
-    if (payment.paymentStatus !== "paid") {
+    if (
+      payment.paymentStatus !== "paid" &&
+      payment.status !== "paid" &&
+      payment.status !== "refund_pending"
+    ) {
       res.status(400).json({
         success: false,
         message:
-          "Only paid subscriptions can be rejected and refunded.",
+          "Only successful payments can be rejected and refunded.",
       });
       return;
     }
@@ -914,13 +891,41 @@ if (
     if (!subscriptionId) {
       res.status(400).json({
         success: false,
-        message:
-          "Stripe subscription ID is missing from this payment.",
+        message: "Stripe subscription ID is missing.",
       });
       return;
     }
 
     const stripe = getStripe();
+
+    // Retrieve subscription before attempting cancellation.
+    const subscription =
+      await stripe.subscriptions.retrieve(subscriptionId);
+
+    // Cancel the subscription if it is still active.
+    if (subscription.status !== "canceled") {
+      await stripe.subscriptions.cancel(subscriptionId);
+    }
+
+    // Save cancellation immediately. If refund fails,
+    // the database still records that the subscription was canceled.
+    await payments.updateOne(
+      { _id: new ObjectId(paymentId) },
+      {
+        $set: {
+          cancellationStatus: "canceled",
+          subscriptionStatus: "canceled",
+          rejectedAt: payment.rejectedAt || new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    await updateUserSubscription(
+      payment.userId,
+      subscriptionId,
+      "canceled"
+    );
 
     // Find the initial PaymentIntent.
     let paymentIntentId =
@@ -934,67 +939,149 @@ if (
           payment.stripeSessionId
         );
 
-      paymentIntentId =
-        await getInitialPaymentIntentId(
-          stripe,
-          session
-        );
+      paymentIntentId = await getInitialPaymentIntentId(
+        stripe,
+        session
+      );
     }
 
     if (!paymentIntentId) {
-      res.status(400).json({
+      const latestSubscription =
+        await stripe.subscriptions.retrieve(
+          subscriptionId,
+          { expand: ["latest_invoice"] }
+        );
+
+      const invoice = latestSubscription.latest_invoice;
+
+      const invoiceId =
+        typeof invoice === "string"
+          ? invoice
+          : invoice?.id ?? null;
+
+      if (invoiceId) {
+        paymentIntentId = await getPaymentIntentFromInvoice(
+          stripe,
+          invoiceId
+        );
+      }
+    }
+
+    if (!paymentIntentId) {
+      await payments.updateOne(
+        { _id: new ObjectId(paymentId) },
+        {
+          $set: {
+            refundStatus: "failed",
+            refundFailureReason:
+              "Initial Stripe PaymentIntent could not be found. Subscription was canceled.",
+            status: "paid",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.status(409).json({
         success: false,
         message:
-          "Initial Stripe payment could not be found. Subscription was not canceled.",
+          "Subscription canceled, but the initial payment could not be found for refund. The payment record has been marked for review.",
       });
       return;
     }
 
-    // Confirm subscription exists.
-    const subscription =
-      await stripe.subscriptions.retrieve(
-        subscriptionId
-      );
-
-    // Cancel subscription if not already canceled.
-    if (subscription.status !== "canceled") {
-      await stripe.subscriptions.cancel(
-        subscriptionId
-      );
-    }
-
-    // Refund the initial payment.
-    // Stable idempotency key prevents duplicate refunds on retry.
-    const refund = await stripe.refunds.create(
-      {
-        payment_intent: paymentIntentId,
-      },
-      {
-        idempotencyKey:
-          `mentorlagbe-refund-${paymentId}`,
-      }
+    // Reuse the same idempotency key for an unfinished attempt.
+    // A new key is created only after a previous refund failed.
+    const previousAttempt = Number(
+      payment.refundAttempts || 0
     );
 
-    // Downgrade the matching user's subscription.
-    await updateUserSubscription(
-      payment.userId,
-      subscriptionId,
-      "canceled"
-    );
+    const attempt =
+      payment.refundStatus === "failed"
+        ? previousAttempt + 1
+        : Math.max(previousAttempt, 1);
 
-    // Save refund information in MongoDB.
+    const idempotencyKey =
+      payment.refundStatus === "pending" &&
+      payment.refundAttemptKey
+        ? payment.refundAttemptKey
+        : `mentorlagbe-refund-${paymentId}-${attempt}`;
+
     await payments.updateOne(
       { _id: new ObjectId(paymentId) },
       {
         $set: {
-          paymentStatus: "refunded",
-          status: "refunded",
-          refundStatus: refund.status ?? "pending",
+          refundStatus: "pending",
+          refundAttemptKey: idempotencyKey,
+          refundAttempts: attempt,
+          stripePaymentIntentId: paymentIntentId,
+          paymentIntentId,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    let refund: Stripe.Refund;
+
+    try {
+      refund = await stripe.refunds.create(
+        {
+          payment_intent: paymentIntentId,
+        },
+        {
+          idempotencyKey,
+        }
+      );
+    } catch (refundError) {
+      const reason =
+        refundError instanceof Error
+          ? refundError.message
+          : "Stripe refund request failed.";
+
+      await payments.updateOne(
+        { _id: new ObjectId(paymentId) },
+        {
+          $set: {
+            refundStatus: "failed",
+            refundFailureReason: reason,
+            cancellationStatus: "canceled",
+            status: "paid",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.status(502).json({
+        success: false,
+        message:
+          "Subscription canceled, but Stripe could not complete the refund. You can retry the refund from Admin Payments.",
+        refundStatus: "failed",
+      });
+      return;
+    }
+
+    const refundStatus = refund.status || "pending";
+    const refundSucceeded = refundStatus === "succeeded";
+
+    await payments.updateOne(
+      { _id: new ObjectId(paymentId) },
+      {
+        $set: {
+          paymentStatus: refundSucceeded ? "refunded" : "paid",
+          status: refundSucceeded
+            ? "refunded"
+            : "refund_pending",
+          refundStatus,
           stripeRefundId: refund.id,
           refundId: refund.id,
           refundedAmount: refund.amount / 100,
-          refundedAt: new Date(),
-          rejectedAt: new Date(),
+          refundCurrency: refund.currency.toUpperCase(),
+          refundFailureReason:
+            refundStatus === "failed"
+              ? "Stripe reported that the refund failed."
+              : null,
+          refundedAt: refundSucceeded ? new Date() : null,
+          cancellationStatus: "canceled",
+          subscriptionStatus: "canceled",
           updatedAt: new Date(),
         },
       }
@@ -1002,8 +1089,9 @@ if (
 
     res.status(200).json({
       success: true,
-      message:
-        "Payment rejected, subscription canceled, and initial payment refund requested successfully.",
+      message: refundSucceeded
+        ? "Subscription canceled and initial payment refunded successfully."
+        : "Subscription canceled. Stripe is processing the refund.",
       refund: {
         id: refund.id,
         status: refund.status,
@@ -1012,20 +1100,15 @@ if (
       },
     });
   } catch (error) {
-    console.error(
-      "Admin payment rejection failed:",
-      error
-    );
-
+    console.error("Admin payment rejection failed:", error);
     next(error);
   }
 };
 
 // --------------------------------------------------
-// Routes
+// ROUTES
 // --------------------------------------------------
 
-// Common PRO checkout endpoint
 router.post(
   "/create-checkout-session",
   verifyToken,
@@ -1033,21 +1116,18 @@ router.post(
   createCheckoutSession
 );
 
-// Verify payment
 router.post(
   "/verify-session",
   verifyToken,
   verifyCheckoutSession
 );
 
-// User payment history
 router.get(
   "/my-payments",
   verifyToken,
   getMyPayments
 );
 
-// Admin: all Pro payments
 router.get(
   "/admin/all",
   verifyToken,
@@ -1055,7 +1135,6 @@ router.get(
   getAllPayments
 );
 
-// Admin: reject, cancel and refund
 router.post(
   "/admin/:paymentId/reject",
   verifyToken,
@@ -1063,10 +1142,6 @@ router.post(
   rejectPayment
 );
 
-// Stripe webhook
-router.post(
-  "/webhook",
-  stripeWebhook
-);
+router.post("/webhook", stripeWebhook);
 
 export default router;
