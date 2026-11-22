@@ -1,12 +1,15 @@
+
 import { Router, type RequestHandler } from "express";
 import { ObjectId } from "mongodb";
 import Stripe from "stripe";
 
 import { getDB } from "../config/db.js";
-
 import { getCollections } from "../config/collections.js";
 import { getStripe } from "../config/stripe.js";
-import { verifyToken } from "../middlewares/auth.middleware.js";
+import {
+  verifyToken,
+  verifyAdmin,
+} from "../middlewares/auth.middleware.js";
 
 const router = Router();
 
@@ -20,6 +23,19 @@ interface AuthUser {
 
 type ProPlan = "pro_student" | "pro_tutor";
 
+interface InvoicePaymentEntry {
+  payment?: {
+    type?: string;
+    payment_intent?: string | Stripe.PaymentIntent | null;
+  };
+}
+
+interface InvoiceWithPayments {
+  payments?: {
+    data?: InvoicePaymentEntry[];
+  };
+}
+
 // --------------------------------------------------
 // Helpers
 // --------------------------------------------------
@@ -32,12 +48,97 @@ const getSubscriptionId = (
     : session.subscription?.id ?? null;
 };
 
-const getPaymentIntentId = (
+const getSessionInvoiceId = (
   session: Stripe.Checkout.Session
 ): string | null => {
-  return typeof session.payment_intent === "string"
-    ? session.payment_intent
-    : session.payment_intent?.id ?? null;
+  return typeof session.invoice === "string"
+    ? session.invoice
+    : session.invoice?.id ?? null;
+};
+
+// Get PaymentIntent from an invoice
+const getPaymentIntentFromInvoice = async (
+  stripe: Stripe,
+  invoiceId: string
+): Promise<string | null> => {
+  const invoice = await stripe.invoices.retrieve(invoiceId, {
+    expand: ["payments.data.payment.payment_intent"],
+  });
+
+  const invoiceWithPayments =
+    invoice as unknown as InvoiceWithPayments;
+
+  const entries = invoiceWithPayments.payments?.data ?? [];
+
+  for (const entry of entries) {
+    const payment = entry.payment;
+
+    if (payment?.type !== "payment_intent") {
+      continue;
+    }
+
+    const intent = payment.payment_intent;
+
+    if (typeof intent === "string") {
+      return intent;
+    }
+
+    if (intent && typeof intent === "object" && intent.id) {
+      return intent.id;
+    }
+  }
+
+  return null;
+};
+
+// Get the initial subscription PaymentIntent
+const getInitialPaymentIntentId = async (
+  stripe: Stripe,
+  session: Stripe.Checkout.Session
+): Promise<string | null> => {
+  const directIntent =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id ?? null;
+
+  if (directIntent) {
+    return directIntent;
+  }
+
+  const invoiceId = getSessionInvoiceId(session);
+
+  if (invoiceId) {
+    const paymentIntentId =
+      await getPaymentIntentFromInvoice(stripe, invoiceId);
+
+    if (paymentIntentId) {
+      return paymentIntentId;
+    }
+  }
+
+  const subscriptionId = getSubscriptionId(session);
+
+  if (!subscriptionId) {
+    return null;
+  }
+
+  const subscription =
+    await stripe.subscriptions.retrieve(subscriptionId, {
+      expand: ["latest_invoice"],
+    });
+
+  const latestInvoice = subscription.latest_invoice;
+
+  const latestInvoiceId =
+    typeof latestInvoice === "string"
+      ? latestInvoice
+      : latestInvoice?.id ?? null;
+
+  if (!latestInvoiceId) {
+    return null;
+  }
+
+  return getPaymentIntentFromInvoice(stripe, latestInvoiceId);
 };
 
 // --------------------------------------------------
@@ -54,7 +155,8 @@ const updateUserSubscription = async (
     throw new Error("Invalid user ID.");
   }
 
-  const active = status === "active" || status === "trialing";
+  const active =
+    status === "active" || status === "trialing";
 
   const filter = allowReplace
     ? { _id: new ObjectId(userId) }
@@ -65,17 +167,14 @@ const updateUserSubscription = async (
 
   const { users } = getCollections();
 
-const result = await users.updateOne(
-  filter,
-    {
-      $set: {
-        plan: active ? "pro" : "free",
-        stripeSubscriptionId: subscriptionId,
-        subscriptionStatus: status,
-        updatedAt: new Date(),
-      },
-    }
-  );
+  const result = await users.updateOne(filter, {
+    $set: {
+      plan: active ? "pro" : "free",
+      stripeSubscriptionId: subscriptionId,
+      subscriptionStatus: status,
+      updatedAt: new Date(),
+    },
+  });
 
   if (result.matchedCount === 0) {
     console.log(
@@ -106,7 +205,26 @@ const savePaymentRecord = async (
     session.status !== "complete" ||
     session.payment_status !== "paid"
   ) {
-    throw new Error("Checkout session is not a completed paid subscription.");
+    throw new Error(
+      "Checkout session is not a completed paid subscription."
+    );
+  }
+
+  const stripe = getStripe();
+
+  const subscriptionId = getSubscriptionId(session);
+
+  if (!subscriptionId) {
+    throw new Error("Subscription ID not found.");
+  }
+
+  const paymentIntentId =
+    await getInitialPaymentIntentId(stripe, session);
+
+  if (!paymentIntentId) {
+    throw new Error(
+      "Initial Stripe PaymentIntent could not be found."
+    );
   }
 
   const { payments } = getCollections();
@@ -119,13 +237,16 @@ const savePaymentRecord = async (
     }
   );
 
-  const subscriptionId = getSubscriptionId(session);
-  const paymentIntentId = getPaymentIntentId(session);
-
   const paymentRecord = {
     userId: metadata.userId,
-    userEmail: metadata.userEmail || session.customer_details?.email || "",
-    userName: metadata.userName || session.customer_details?.name || "",
+    userEmail:
+      metadata.userEmail ||
+      session.customer_details?.email ||
+      "",
+    userName:
+      metadata.userName ||
+      session.customer_details?.name ||
+      "",
     userRole: metadata.role,
     role: metadata.role,
     plan: metadata.plan,
@@ -135,7 +256,7 @@ const savePaymentRecord = async (
         : "Student PRO",
     amount: (session.amount_total ?? 0) / 100,
     currency: session.currency?.toUpperCase() ?? "USD",
-    transactionId: paymentIntentId || session.id,
+    transactionId: paymentIntentId,
     stripeSessionId: session.id,
     stripeSubscriptionId: subscriptionId,
     stripePaymentIntentId: paymentIntentId,
@@ -144,6 +265,7 @@ const savePaymentRecord = async (
     paymentStatus: "paid",
     status: "paid",
     method: "stripe",
+    refundStatus: "not_refunded",
     paidAt: new Date(),
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -209,7 +331,8 @@ const validateCheckoutPlan: RequestHandler = (
   if (requestedPlan !== expectedPlan) {
     res.status(400).json({
       success: false,
-      message: "Selected plan does not match your account role.",
+      message:
+        "Selected plan does not match your account role.",
     });
     return;
   }
@@ -229,10 +352,14 @@ const createCheckoutSession: RequestHandler = async (
   try {
     const user = res.locals.user as AuthUser;
 
-    if (user.role !== "student" && user.role !== "tutor") {
+    if (
+      user.role !== "student" &&
+      user.role !== "tutor"
+    ) {
       res.status(403).json({
         success: false,
-        message: "Only students and tutors can purchase Pro.",
+        message:
+          "Only students and tutors can purchase Pro.",
       });
       return;
     }
@@ -246,8 +373,8 @@ const createCheckoutSession: RequestHandler = async (
     }
 
     const dbUser = await getDB()
-  .collection("user")
-  .findOne({ _id: new ObjectId(user.id) });
+      .collection("user")
+      .findOne({ _id: new ObjectId(user.id) });
 
     if (!dbUser) {
       res.status(404).json({
@@ -277,64 +404,77 @@ const createCheckoutSession: RequestHandler = async (
 
     const clientURL = (
       process.env.CLIENT_URL || ""
-    ).split(",")[0].trim().replace(/\/$/, "");
+    )
+      .split(",")[0]
+      .trim()
+      .replace(/\/$/, "");
 
     if (!clientURL) {
       throw new Error("CLIENT_URL is missing.");
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
+    const session =
+      await stripe.checkout.sessions.create({
+        mode: "subscription",
 
-      customer_email: user.email || dbUser.email,
+        customer_email:
+          user.email || dbUser.email,
 
-      client_reference_id: user.id,
+        client_reference_id: user.id,
 
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: isTutor
-                ? "MentorLagbe Pro Tutor"
-                : "MentorLagbe Pro Student",
-              description: "MentorLagbe monthly Pro subscription",
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: isTutor
+                  ? "MentorLagbe Pro Tutor"
+                  : "MentorLagbe Pro Student",
+                description:
+                  "MentorLagbe monthly Pro subscription",
+              },
+              unit_amount: amount,
+              recurring: {
+                interval: "month",
+              },
             },
-            unit_amount: amount,
-            recurring: {
-              interval: "month",
-            },
+            quantity: 1,
           },
-          quantity: 1,
-        },
-      ],
+        ],
 
-      subscription_data: {
+        subscription_data: {
+          metadata: {
+            userId: user.id,
+            role: user.role,
+            plan,
+            userName:
+              user.name || dbUser.name || "",
+            userEmail:
+              user.email || dbUser.email || "",
+          },
+        },
+
         metadata: {
           userId: user.id,
           role: user.role,
           plan,
-          userName: user.name || dbUser.name || "",
-          userEmail: user.email || dbUser.email || "",
+          userName:
+            user.name || dbUser.name || "",
+          userEmail:
+            user.email || dbUser.email || "",
         },
-      },
 
-      metadata: {
-        userId: user.id,
-        role: user.role,
-        plan,
-        userName: user.name || dbUser.name || "",
-        userEmail: user.email || dbUser.email || "",
-      },
+        success_url:
+          `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
 
-      success_url: `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-
-      cancel_url: `${clientURL}/payment/cancel`,
-    });
+        cancel_url:
+          `${clientURL}/payment/cancel`,
+      });
 
     res.status(200).json({
       success: true,
-      message: "Subscription checkout created successfully.",
+      message:
+        "Subscription checkout created successfully.",
       url: session.url,
     });
   } catch (error) {
@@ -368,9 +508,8 @@ const verifyCheckoutSession: RequestHandler = async (
 
     const stripe = getStripe();
 
-    const session = await stripe.checkout.sessions.retrieve(
-      sessionId
-    );
+    const session =
+      await stripe.checkout.sessions.retrieve(sessionId);
 
     if (
       session.status !== "complete" ||
@@ -379,7 +518,8 @@ const verifyCheckoutSession: RequestHandler = async (
     ) {
       res.status(400).json({
         success: false,
-        message: "Subscription checkout is not completed.",
+        message:
+          "Subscription checkout is not completed.",
       });
       return;
     }
@@ -390,7 +530,8 @@ const verifyCheckoutSession: RequestHandler = async (
     ) {
       res.status(403).json({
         success: false,
-        message: "This subscription does not belong to your account.",
+        message:
+          "This subscription does not belong to your account.",
       });
       return;
     }
@@ -409,7 +550,8 @@ const verifyCheckoutSession: RequestHandler = async (
     if (session.metadata?.role !== user.role) {
       res.status(403).json({
         success: false,
-        message: "Subscription role does not match your account.",
+        message:
+          "Subscription role does not match your account.",
       });
       return;
     }
@@ -427,7 +569,8 @@ const verifyCheckoutSession: RequestHandler = async (
       return;
     }
 
-    const subscriptionId = getSubscriptionId(session);
+    const subscriptionId =
+      getSubscriptionId(session);
 
     if (!subscriptionId) {
       res.status(400).json({
@@ -458,10 +601,14 @@ const verifyCheckoutSession: RequestHandler = async (
     ) {
       res.status(403).json({
         success: false,
-        message: "Subscription details do not match your account.",
+        message:
+          "Subscription details do not match your account.",
       });
       return;
     }
+
+    // Save payment before activating the user's Pro plan.
+    await savePaymentRecord(session);
 
     await updateUserSubscription(
       user.id,
@@ -470,11 +617,10 @@ const verifyCheckoutSession: RequestHandler = async (
       true
     );
 
-    await savePaymentRecord(session);
-
     res.status(200).json({
       success: true,
-      message: "Your MentorLagbe Pro subscription is active!",
+      message:
+        "Your MentorLagbe Pro subscription is active!",
       plan: "pro",
       subscriptionStatus: subscription.status,
     });
@@ -491,21 +637,30 @@ const stripeWebhook: RequestHandler = async (
   req,
   res
 ) => {
-  const signature = req.headers["stripe-signature"];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const signature =
+    req.headers["stripe-signature"];
+
+  const webhookSecret =
+    process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!webhookSecret) {
-    res.status(500).send("Stripe webhook secret is missing.");
+    res.status(500).send(
+      "Stripe webhook secret is missing."
+    );
     return;
   }
 
   if (typeof signature !== "string") {
-    res.status(400).send("Missing Stripe signature.");
+    res.status(400).send(
+      "Missing Stripe signature."
+    );
     return;
   }
 
   if (!Buffer.isBuffer(req.body)) {
-    res.status(400).send("Invalid webhook request body.");
+    res.status(400).send(
+      "Invalid webhook request body."
+    );
     return;
   }
 
@@ -520,8 +675,14 @@ const stripeWebhook: RequestHandler = async (
       webhookSecret
     );
   } catch (error) {
-    console.error("Stripe webhook signature error:", error);
-    res.status(400).send("Invalid Stripe webhook signature.");
+    console.error(
+      "Stripe webhook signature error:",
+      error
+    );
+
+    res.status(400).send(
+      "Invalid Stripe webhook signature."
+    );
     return;
   }
 
@@ -536,16 +697,22 @@ const stripeWebhook: RequestHandler = async (
           session.payment_status === "paid" &&
           session.status === "complete"
         ) {
-          const subscriptionId = getSubscriptionId(session);
+          const subscriptionId =
+            getSubscriptionId(session);
 
           if (!subscriptionId) {
-            throw new Error("Subscription ID not found.");
+            throw new Error(
+              "Subscription ID not found."
+            );
           }
 
           const subscription =
-            await stripe.subscriptions.retrieve(subscriptionId);
+            await stripe.subscriptions.retrieve(
+              subscriptionId
+            );
 
-          const userId = session.metadata?.userId;
+          const userId =
+            session.metadata?.userId;
 
           if (
             userId &&
@@ -553,14 +720,14 @@ const stripeWebhook: RequestHandler = async (
             (subscription.status === "active" ||
               subscription.status === "trialing")
           ) {
+            await savePaymentRecord(session);
+
             await updateUserSubscription(
               userId,
               subscription.id,
               subscription.status,
               true
             );
-
-            await savePaymentRecord(session);
           }
         }
 
@@ -571,7 +738,8 @@ const stripeWebhook: RequestHandler = async (
         const subscription =
           event.data.object as Stripe.Subscription;
 
-        const userId = subscription.metadata.userId;
+        const userId =
+          subscription.metadata.userId;
 
         if (userId) {
           await updateUserSubscription(
@@ -588,7 +756,8 @@ const stripeWebhook: RequestHandler = async (
         const subscription =
           event.data.object as Stripe.Subscription;
 
-        const userId = subscription.metadata.userId;
+        const userId =
+          subscription.metadata.userId;
 
         if (userId) {
           await updateUserSubscription(
@@ -609,7 +778,10 @@ const stripeWebhook: RequestHandler = async (
       received: true,
     });
   } catch (error) {
-    console.error("Stripe webhook processing failed:", error);
+    console.error(
+      "Stripe webhook processing failed:",
+      error
+    );
 
     res.status(500).json({
       success: false,
@@ -647,10 +819,213 @@ const getMyPayments: RequestHandler = async (
 };
 
 // --------------------------------------------------
+// Admin: Get all Pro subscription payments
+// --------------------------------------------------
+
+const getAllPayments: RequestHandler = async (
+  _req,
+  res,
+  next
+) => {
+  try {
+    const { payments } = getCollections();
+
+    const records = await payments
+      .find({
+        $or: [
+          { plan: "pro_student" },
+          { plan: "pro_tutor" },
+          { plan: "student-pro" },
+          { plan: "tutor-pro" },
+        ],
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      total: records.length,
+      payments: records,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// --------------------------------------------------
+// Admin: Reject payment, cancel subscription, refund
+// --------------------------------------------------
+
+const rejectPayment: RequestHandler = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const paymentId = req.params.paymentId;
+
+if (
+  typeof paymentId !== "string" ||
+  !ObjectId.isValid(paymentId)
+) {
+  res.status(400).json({
+    success: false,
+    message: "Invalid payment ID.",
+  });
+  return;
+}
+
+    const { payments } = getCollections();
+
+    const payment = await payments.findOne({
+      _id: new ObjectId(paymentId),
+    });
+
+    if (!payment) {
+      res.status(404).json({
+        success: false,
+        message: "Payment record not found.",
+      });
+      return;
+    }
+
+    if (payment.paymentStatus === "refunded") {
+      res.status(200).json({
+        success: true,
+        message: "This payment has already been refunded.",
+        payment,
+      });
+      return;
+    }
+
+    if (payment.paymentStatus !== "paid") {
+      res.status(400).json({
+        success: false,
+        message:
+          "Only paid subscriptions can be rejected and refunded.",
+      });
+      return;
+    }
+
+    const subscriptionId =
+      payment.stripeSubscriptionId ||
+      payment.subscriptionId;
+
+    if (!subscriptionId) {
+      res.status(400).json({
+        success: false,
+        message:
+          "Stripe subscription ID is missing from this payment.",
+      });
+      return;
+    }
+
+    const stripe = getStripe();
+
+    // Find the initial PaymentIntent.
+    let paymentIntentId =
+      payment.stripePaymentIntentId ||
+      payment.paymentIntentId ||
+      null;
+
+    if (!paymentIntentId && payment.stripeSessionId) {
+      const session =
+        await stripe.checkout.sessions.retrieve(
+          payment.stripeSessionId
+        );
+
+      paymentIntentId =
+        await getInitialPaymentIntentId(
+          stripe,
+          session
+        );
+    }
+
+    if (!paymentIntentId) {
+      res.status(400).json({
+        success: false,
+        message:
+          "Initial Stripe payment could not be found. Subscription was not canceled.",
+      });
+      return;
+    }
+
+    // Confirm subscription exists.
+    const subscription =
+      await stripe.subscriptions.retrieve(
+        subscriptionId
+      );
+
+    // Cancel subscription if not already canceled.
+    if (subscription.status !== "canceled") {
+      await stripe.subscriptions.cancel(
+        subscriptionId
+      );
+    }
+
+    // Refund the initial payment.
+    // Stable idempotency key prevents duplicate refunds on retry.
+    const refund = await stripe.refunds.create(
+      {
+        payment_intent: paymentIntentId,
+      },
+      {
+        idempotencyKey:
+          `mentorlagbe-refund-${paymentId}`,
+      }
+    );
+
+    // Downgrade the matching user's subscription.
+    await updateUserSubscription(
+      payment.userId,
+      subscriptionId,
+      "canceled"
+    );
+
+    // Save refund information in MongoDB.
+    await payments.updateOne(
+      { _id: new ObjectId(paymentId) },
+      {
+        $set: {
+          paymentStatus: "refunded",
+          status: "refunded",
+          refundStatus: refund.status ?? "pending",
+          stripeRefundId: refund.id,
+          refundId: refund.id,
+          refundedAmount: refund.amount / 100,
+          refundedAt: new Date(),
+          rejectedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message:
+        "Payment rejected, subscription canceled, and initial payment refund requested successfully.",
+      refund: {
+        id: refund.id,
+        status: refund.status,
+        amount: refund.amount / 100,
+        currency: refund.currency,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "Admin payment rejection failed:",
+      error
+    );
+
+    next(error);
+  }
+};
+
+// --------------------------------------------------
 // Routes
 // --------------------------------------------------
 
-// Common PRO checkout endpoint for Student and Tutor
+// Common PRO checkout endpoint
 router.post(
   "/create-checkout-session",
   verifyToken,
@@ -665,13 +1040,28 @@ router.post(
   verifyCheckoutSession
 );
 
-// Logged-in user's payment history
+// User payment history
 router.get(
   "/my-payments",
   verifyToken,
   getMyPayments
 );
 
+// Admin: all Pro payments
+router.get(
+  "/admin/all",
+  verifyToken,
+  verifyAdmin,
+  getAllPayments
+);
+
+// Admin: reject, cancel and refund
+router.post(
+  "/admin/:paymentId/reject",
+  verifyToken,
+  verifyAdmin,
+  rejectPayment
+);
 
 // Stripe webhook
 router.post(
