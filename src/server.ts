@@ -28,52 +28,57 @@ export const createApp = async (): Promise<Express> => {
   const app = express();
 
   // 4. Configure allowed frontend origins
+
   const allowedOrigins = new Set(
-    [
-      "http://localhost:3000",
-      ...(process.env.CLIENT_URL || "")
-        .split(",")
-        .map((origin) => origin.trim()),
-    ]
-      .filter(Boolean)
-      .map((origin) => origin.replace(/\/+$/, ""))
-  );
+  [
+    "http://localhost:3000",
+    "https://mentor-lagbe-red.vercel.app",
 
-  // 5. CORS configuration
-  app.use(
-    cors({
-      origin: (origin, callback) => {
-        if (!origin) {
-          return callback(null, true);
-        }
+    ...(process.env.CLIENT_URL || "")
+      .split(",")
+      .map((origin) => origin.trim()),
+  ]
+    .filter(Boolean)
+    .map((origin) => origin.replace(/\/+$/, ""))
+);
 
-        const normalizedOrigin = origin.replace(/\/+$/, "");
+// 5. CORS configuration
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) {
+        return callback(null, true);
+      }
 
-        if (allowedOrigins.has(normalizedOrigin)) {
-          return callback(null, true);
-        }
+      const normalizedOrigin = origin.replace(/\/+$/, "");
 
-        return callback(
-          new Error(`CORS blocked origin: ${origin}`)
-        );
-      },
-      credentials: true,
-      methods: [
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-      ],
-      allowedHeaders: [
-        "Content-Type",
-        "Authorization",
-        "X-Requested-With",
-      ],
-      maxAge: 86400,
-    })
-  );
+      if (allowedOrigins.has(normalizedOrigin)) {
+        return callback(null, true);
+      }
+
+      console.error(`CORS blocked origin: ${origin}`);
+
+      return callback(
+        new Error(`CORS blocked origin: ${origin}`)
+      );
+    },
+    credentials: true,
+    methods: [
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+      "OPTIONS",
+    ],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+    ],
+    maxAge: 86400,
+  })
+);
 
   // 6. Initialize Better Auth AFTER MongoDB connection
   const auth = createAuth();
