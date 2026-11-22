@@ -39,22 +39,48 @@ function getString(value: unknown): string {
 
 function getNumber(value: unknown): number {
   if (typeof value === "number") return value;
+
   if (typeof value === "string" && value.trim() !== "") {
     return Number(value);
   }
+
   return Number.NaN;
 }
 
 function getStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
 
-  return value.filter(
-    (item): item is string => typeof item === "string"
-  ).map((item) => item.trim()).filter(Boolean);
+  return value
+    .filter(
+      (item): item is string => typeof item === "string"
+    )
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
-function getId(value: string | string[] | undefined): string {
+function getId(
+  value: string | string[] | undefined
+): string {
   return Array.isArray(value) ? value[0] || "" : value || "";
+}
+
+// ==========================================
+// TUTOR OWNERSHIP FILTER
+// Supports new and legacy tuition posts
+// ==========================================
+function getOwnerFilter(user: TutorUser) {
+  if (user.email) {
+    return {
+      $or: [
+        { tutorId: user.id },
+        { tutorEmail: user.email },
+      ],
+    };
+  }
+
+  return {
+    tutorId: user.id,
+  };
 }
 
 // ==========================================
@@ -66,15 +92,23 @@ router.post("/my-tuitions", async (req, res, next) => {
     const body = getBody(req.body);
     const { tuitions } = getCollections();
 
+    if (!user?.id) {
+      res.status(401).json({
+        success: false,
+        message: "Tutor authentication information is missing.",
+      });
+      return;
+    }
+
     const title = getString(body.title);
     const classLevel = getString(body.classLevel);
     const location = getString(body.location);
     const area = getString(body.area);
 
     const subjects = getStringArray(body.subjects);
+
     const subject =
-      getString(body.subject) ||
-      subjects.join(", ");
+      getString(body.subject) || subjects.join(", ");
 
     const monthlyFee = getNumber(
       body.monthlyFee ?? body.salary
@@ -109,12 +143,12 @@ router.post("/my-tuitions", async (req, res, next) => {
       return;
     }
 
-    // Free Tutor: maximum 2 tuition posts.
-    // Pro Tutor: unlimited tuition posts.
+    // Free Tutor: maximum 2 posts.
+    // Count both new and legacy posts.
     if (user.plan?.toLowerCase() !== "pro") {
-      const existingCount = await tuitions.countDocuments({
-        tutorId: user.id,
-      });
+      const existingCount = await tuitions.countDocuments(
+        getOwnerFilter(user)
+      );
 
       if (existingCount >= 2) {
         res.status(403).json({
@@ -130,6 +164,7 @@ router.post("/my-tuitions", async (req, res, next) => {
     const now = new Date();
 
     const daysPerWeek = getNumber(body.daysPerWeek);
+
     const safeDaysPerWeek =
       Number.isInteger(daysPerWeek) &&
       daysPerWeek >= 1 &&
@@ -149,18 +184,17 @@ router.post("/my-tuitions", async (req, res, next) => {
       // Assignment 9 fields
       mode,
       monthlyFee,
-      daysPerWeek,
+      daysPerWeek: safeDaysPerWeek,
       bannerImage,
       description: getString(body.description),
 
       location,
-      tutorName: user.name || "Tutor",
-      tutorEmail: user.email || "",
+tutorName: user.name || "Tutor",
 
-      approvalStatus: "pending",
-      isActive: true,
+approvalStatus: "pending",
+isActive: true,
 
-      // Legacy fields retained for existing frontend compatibility
+      // Legacy fields retained for frontend compatibility
       subjects: subjects.length > 0 ? subjects : [subject],
       medium: getString(body.medium),
       curriculum: getString(body.curriculum) || "NCTB",
@@ -187,9 +221,10 @@ router.post("/my-tuitions", async (req, res, next) => {
       contactNumber: getString(body.contactNumber),
       applicationDeadline: body.applicationDeadline || null,
 
+      // Owner information
       tutorId: user.id,
+      tutorEmail: user.email || "",
 
-      // Legacy status now reflects approval, not active/inactive.
       status: "pending",
 
       createdAt: now,
@@ -211,10 +246,9 @@ router.post("/my-tuitions", async (req, res, next) => {
   }
 });
 
-
 // ==========================================
 // GET TUTOR'S OWN TUITION POSTS
-// Supports both new and legacy tuition posts
+// Supports new and legacy tuition posts
 // ==========================================
 router.get("/my-tuitions", async (_req, res, next) => {
   try {
@@ -229,21 +263,8 @@ router.get("/my-tuitions", async (_req, res, next) => {
       return;
     }
 
-    // New posts use tutorId.
-    // Older posts may only contain tutorEmail.
-    const ownerFilter = user.email
-      ? {
-          $or: [
-            { tutorId: user.id },
-            { tutorEmail: user.email },
-          ],
-        }
-      : {
-          tutorId: user.id,
-        };
-
     const result = await tuitions
-      .find(ownerFilter)
+      .find(getOwnerFilter(user))
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -256,110 +277,119 @@ router.get("/my-tuitions", async (_req, res, next) => {
   }
 });
 
-
 // ==========================================
 // TOGGLE TUITION ACTIVE / INACTIVE
 // ==========================================
-router.patch("/my-tuitions/:id/active", async (req, res, next) => {
-  try {
-    const user = res.locals.user as TutorUser;
-    const id = getId(req.params.id);
-    const body = getBody(req.body);
+router.patch(
+  "/my-tuitions/:id/active",
+  async (req, res, next) => {
+    try {
+      const user = res.locals.user as TutorUser;
+      const id = getId(req.params.id);
+      const body = getBody(req.body);
 
-    if (!id || !ObjectId.isValid(id)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid tuition ID.",
-      });
-      return;
-    }
-
-    if (typeof body.isActive !== "boolean") {
-      res.status(400).json({
-        success: false,
-        message: "isActive must be true or false.",
-      });
-      return;
-    }
-
-    const { tuitions } = getCollections();
-
-    const result = await tuitions.updateOne(
-      {
-        _id: new ObjectId(id),
-        tutorId: user.id,
-      },
-      {
-        $set: {
-          isActive: body.isActive,
-          updatedAt: new Date(),
-        },
+      if (!id || !ObjectId.isValid(id)) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid tuition ID.",
+        });
+        return;
       }
-    );
 
-    if (result.matchedCount === 0) {
-      res.status(404).json({
-        success: false,
-        message: "Tuition not found.",
+      if (typeof body.isActive !== "boolean") {
+        res.status(400).json({
+          success: false,
+          message: "isActive must be true or false.",
+        });
+        return;
+      }
+
+      const { tuitions } = getCollections();
+
+      const result = await tuitions.updateOne(
+        {
+          _id: new ObjectId(id),
+          ...getOwnerFilter(user),
+        },
+        {
+          $set: {
+            isActive: body.isActive,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Tuition not found.",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: body.isActive
+          ? "Tuition activated successfully."
+          : "Tuition deactivated successfully.",
       });
-      return;
+    } catch (error) {
+      next(error);
     }
-
-    res.status(200).json({
-      success: true,
-      message: body.isActive
-        ? "Tuition activated successfully."
-        : "Tuition deactivated successfully.",
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 // ==========================================
 // GET APPLICANTS FOR A SPECIFIC TUITION
 // ==========================================
-router.get("/applicants/:tuitionId", async (req, res, next) => {
-  try {
-    const user = res.locals.user as TutorUser;
-    const tuitionId = getId(req.params.tuitionId);
+router.get(
+  "/applicants/:tuitionId",
+  async (req, res, next) => {
+    try {
+      const user = res.locals.user as TutorUser;
+      const tuitionId = getId(req.params.tuitionId);
 
-    if (!tuitionId || !ObjectId.isValid(tuitionId)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid tuition ID.",
+      if (!tuitionId || !ObjectId.isValid(tuitionId)) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid tuition ID.",
+        });
+        return;
+      }
+
+      const { tuitions, applications } = getCollections();
+
+      const tuition = await tuitions.findOne({
+        _id: new ObjectId(tuitionId),
+        ...getOwnerFilter(user),
       });
-      return;
-    }
 
-    const { tuitions, applications } = getCollections();
+      if (!tuition) {
+        res.status(404).json({
+          success: false,
+          message: "Tuition not found.",
+        });
+        return;
+      }
 
-    const tuition = await tuitions.findOne({
-      _id: new ObjectId(tuitionId),
-      tutorId: user.id,
-    });
+      const result = await applications
+        .find({
+          tuitionId: {
+            $in: [tuitionId, new ObjectId(tuitionId)],
+          },
+        })
+        .sort({ appliedAt: -1 })
+        .toArray();
 
-    if (!tuition) {
-      res.status(404).json({
-        success: false,
-        message: "Tuition not found.",
+      res.status(200).json({
+        success: true,
+        data: result,
       });
-      return;
+    } catch (error) {
+      next(error);
     }
-
-    const result = await applications
-      .find({ tuitionId })
-      .sort({ appliedAt: -1 })
-      .toArray();
-
-    res.status(200).json({
-      success: true,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 // ==========================================
 // ACCEPT OR REJECT AN APPLICANT
@@ -373,7 +403,10 @@ router.patch(
       const body = getBody(req.body);
       const status = getString(body.status).toLowerCase();
 
-      if (!applicationId || !ObjectId.isValid(applicationId)) {
+      if (
+        !applicationId ||
+        !ObjectId.isValid(applicationId)
+      ) {
         res.status(400).json({
           success: false,
           message: "Invalid application ID.",
@@ -415,7 +448,7 @@ router.patch(
 
       const tuition = await tuitions.findOne({
         _id: new ObjectId(tuitionId),
-        tutorId: user.id,
+        ...getOwnerFilter(user),
       });
 
       if (!tuition) {
@@ -427,7 +460,9 @@ router.patch(
       }
 
       await applications.updateOne(
-        { _id: new ObjectId(applicationId) },
+        {
+          _id: new ObjectId(applicationId),
+        },
         {
           $set: {
             status,
@@ -449,145 +484,164 @@ router.patch(
 // ==========================================
 // UPDATE TUTOR'S OWN TUITION
 // ==========================================
-router.patch("/my-tuitions/:id", async (req, res, next) => {
-  try {
-    const user = res.locals.user as TutorUser;
-    const id = getId(req.params.id);
-    const body = getBody(req.body);
+router.patch(
+  "/my-tuitions/:id",
+  async (req, res, next) => {
+    try {
+      const user = res.locals.user as TutorUser;
+      const id = getId(req.params.id);
+      const body = getBody(req.body);
 
-    if (!id || !ObjectId.isValid(id)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid tuition ID.",
-      });
-      return;
-    }
-
-    const allowedFields = [
-      "title",
-      "subject",
-      "subjects",
-      "classLevel",
-      "mode",
-      "monthlyFee",
-      "daysPerWeek",
-      "bannerImage",
-      "description",
-      "location",
-      "area",
-      "salary",
-      "medium",
-      "curriculum",
-      "category",
-      "tuitionType",
-      "negotiable",
-      "hoursPerDay",
-      "schedule",
-      "tutoringTime",
-      "studentGender",
-      "tutorGender",
-      "numberOfStudents",
-      "institution",
-      "qualification",
-      "experience",
-      "requirements",
-      "contactPerson",
-      "contactNumber",
-      "applicationDeadline",
-    ];
-
-    const updateData: Record<string, unknown> = {};
-
-    for (const field of allowedFields) {
-      if (body[field] !== undefined) {
-        updateData[field] = body[field];
+      if (!id || !ObjectId.isValid(id)) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid tuition ID.",
+        });
+        return;
       }
-    }
 
-    // Keep the legacy salary field synchronized with monthlyFee.
-    if (body.monthlyFee !== undefined) {
-      updateData.salary = body.monthlyFee;
-    } else if (body.salary !== undefined) {
-      updateData.monthlyFee = body.salary;
-    }
+      const allowedFields = [
+        "title",
+        "subject",
+        "subjects",
+        "classLevel",
+        "mode",
+        "monthlyFee",
+        "daysPerWeek",
+        "bannerImage",
+        "description",
+        "location",
+        "area",
+        "salary",
+        "medium",
+        "curriculum",
+        "category",
+        "tuitionType",
+        "negotiable",
+        "hoursPerDay",
+        "schedule",
+        "tutoringTime",
+        "studentGender",
+        "tutorGender",
+        "numberOfStudents",
+        "institution",
+        "qualification",
+        "experience",
+        "requirements",
+        "contactPerson",
+        "contactNumber",
+        "applicationDeadline",
+      ];
 
-    if (Object.keys(updateData).length === 0) {
-      res.status(400).json({
-        success: false,
-        message: "No valid fields provided for update.",
-      });
-      return;
-    }
+      const updateData: Record<string, unknown> = {};
 
-    updateData.updatedAt = new Date();
-
-    const { tuitions } = getCollections();
-
-    const result = await tuitions.updateOne(
-      {
-        _id: new ObjectId(id),
-        tutorId: user.id,
-      },
-      {
-        $set: updateData,
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field];
+        }
       }
-    );
 
-    if (result.matchedCount === 0) {
-      res.status(404).json({
-        success: false,
-        message: "Tuition not found.",
+      // Keep salary and monthlyFee synchronized.
+      if (body.monthlyFee !== undefined) {
+        updateData.salary = body.monthlyFee;
+      } else if (body.salary !== undefined) {
+        updateData.monthlyFee = body.salary;
+      }
+
+      // Keep subject and subjects synchronized.
+      if (body.subjects !== undefined) {
+        const subjects = getStringArray(body.subjects);
+        updateData.subjects = subjects;
+        updateData.subject = subjects.join(", ");
+      } else if (body.subject !== undefined) {
+        const subject = getString(body.subject);
+        updateData.subject = subject;
+        updateData.subjects = subject
+          ? subject.split(",").map((item) => item.trim()).filter(Boolean)
+          : [];
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        res.status(400).json({
+          success: false,
+          message: "No valid fields provided for update.",
+        });
+        return;
+      }
+
+      updateData.updatedAt = new Date();
+
+      const { tuitions } = getCollections();
+
+      const result = await tuitions.updateOne(
+        {
+          _id: new ObjectId(id),
+          ...getOwnerFilter(user),
+        },
+        {
+          $set: updateData,
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Tuition not found.",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Tuition updated successfully.",
       });
-      return;
+    } catch (error) {
+      next(error);
     }
-
-    res.status(200).json({
-      success: true,
-      message: "Tuition updated successfully.",
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 // ==========================================
 // DELETE TUTOR'S OWN TUITION
 // ==========================================
-router.delete("/my-tuitions/:id", async (req, res, next) => {
-  try {
-    const user = res.locals.user as TutorUser;
-    const id = getId(req.params.id);
+router.delete(
+  "/my-tuitions/:id",
+  async (req, res, next) => {
+    try {
+      const user = res.locals.user as TutorUser;
+      const id = getId(req.params.id);
 
-    if (!id || !ObjectId.isValid(id)) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid tuition ID.",
+      if (!id || !ObjectId.isValid(id)) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid tuition ID.",
+        });
+        return;
+      }
+
+      const { tuitions } = getCollections();
+
+      const result = await tuitions.deleteOne({
+        _id: new ObjectId(id),
+        ...getOwnerFilter(user),
       });
-      return;
-    }
 
-    const { tuitions } = getCollections();
+      if (result.deletedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: "Tuition not found.",
+        });
+        return;
+      }
 
-    const result = await tuitions.deleteOne({
-      _id: new ObjectId(id),
-      tutorId: user.id,
-    });
-
-    if (result.deletedCount === 0) {
-      res.status(404).json({
-        success: false,
-        message: "Tuition not found.",
+      res.status(200).json({
+        success: true,
+        message: "Tuition deleted successfully.",
       });
-      return;
+    } catch (error) {
+      next(error);
     }
-
-    res.status(200).json({
-      success: true,
-      message: "Tuition deleted successfully.",
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 export default router;
