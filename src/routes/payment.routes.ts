@@ -1,17 +1,12 @@
 
-import { Router } from "express";
-import type { RequestHandler } from "express";
+import { Router, type RequestHandler } from "express";
 import { ObjectId } from "mongodb";
 import Stripe from "stripe";
 
 import { getDB } from "../config/db.js";
 import { getCollections } from "../config/collections.js";
 import { getStripe } from "../config/stripe.js";
-import {
-  verifyToken,
-  verifyStudent,
-  verifyTutor,
-} from "../middlewares/auth.middleware.js";
+import { verifyToken } from "../middlewares/auth.middleware.js";
 
 const router = Router();
 
@@ -20,9 +15,35 @@ interface AuthUser {
   name?: string;
   email?: string;
   role: "student" | "tutor" | "admin";
+  plan?: string;
 }
 
-// Update user's subscription information
+type ProPlan = "pro_student" | "pro_tutor";
+
+// --------------------------------------------------
+// Helpers
+// --------------------------------------------------
+
+const getSubscriptionId = (
+  session: Stripe.Checkout.Session
+): string | null => {
+  return typeof session.subscription === "string"
+    ? session.subscription
+    : session.subscription?.id ?? null;
+};
+
+const getPaymentIntentId = (
+  session: Stripe.Checkout.Session
+): string | null => {
+  return typeof session.payment_intent === "string"
+    ? session.payment_intent
+    : session.payment_intent?.id ?? null;
+};
+
+// --------------------------------------------------
+// Update user subscription
+// --------------------------------------------------
+
 const updateUserSubscription = async (
   userId: string,
   subscriptionId: string,
@@ -56,50 +77,74 @@ const updateUserSubscription = async (
 
   if (result.matchedCount === 0) {
     console.log(
-      `Subscription update skipped. Subscription ${subscriptionId} is not the current subscription for user ${userId}.`
+      `Subscription update skipped: user=${userId}, subscription=${subscriptionId}`
     );
-    return;
   }
-
-  console.log(
-    `Subscription updated: user=${userId}, status=${status}`
-  );
 };
 
-// Save payment record only once
+// --------------------------------------------------
+// Save payment record once
+// --------------------------------------------------
+
 const savePaymentRecord = async (
   session: Stripe.Checkout.Session
 ): Promise<void> => {
   const metadata = session.metadata;
 
-  if (!metadata?.userId || !metadata?.role || !metadata?.plan) {
-    return;
+  if (
+    !metadata?.userId ||
+    !metadata?.role ||
+    !metadata?.plan
+  ) {
+    throw new Error("Payment metadata is incomplete.");
+  }
+
+  if (
+    session.mode !== "subscription" ||
+    session.status !== "complete" ||
+    session.payment_status !== "paid"
+  ) {
+    throw new Error("Checkout session is not a completed paid subscription.");
   }
 
   const { payments } = getCollections();
 
   await payments.createIndex(
     { stripeSessionId: 1 },
-    { unique: true, name: "unique_stripe_session_id" }
+    {
+      unique: true,
+      name: "unique_stripe_session_id",
+    }
   );
+
+  const subscriptionId = getSubscriptionId(session);
+  const paymentIntentId = getPaymentIntentId(session);
 
   const paymentRecord = {
     userId: metadata.userId,
+    userEmail: metadata.userEmail || session.customer_details?.email || "",
+    userName: metadata.userName || session.customer_details?.name || "",
+    userRole: metadata.role,
     role: metadata.role,
     plan: metadata.plan,
+    planName:
+      metadata.plan === "pro_tutor"
+        ? "Tutor PRO"
+        : "Student PRO",
     amount: (session.amount_total ?? 0) / 100,
-    currency: session.currency,
+    currency: session.currency?.toUpperCase() ?? "USD",
+    transactionId: paymentIntentId || session.id,
     stripeSessionId: session.id,
-    subscriptionId:
-      typeof session.subscription === "string"
-        ? session.subscription
-        : session.subscription?.id ?? null,
-    paymentIntentId:
-      typeof session.payment_intent === "string"
-        ? session.payment_intent
-        : null,
+    stripeSubscriptionId: subscriptionId,
+    stripePaymentIntentId: paymentIntentId,
+    subscriptionId,
+    paymentIntentId,
+    paymentStatus: "paid",
     status: "paid",
+    method: "stripe",
+    paidAt: new Date(),
     createdAt: new Date(),
+    updatedAt: new Date(),
   };
 
   try {
@@ -124,9 +169,58 @@ const savePaymentRecord = async (
   }
 };
 
-// Create monthly Stripe subscription
+// --------------------------------------------------
+// Validate checkout plan
+// --------------------------------------------------
+
+const validateCheckoutPlan: RequestHandler = (
+  req,
+  res,
+  next
+) => {
+  const user = res.locals.user as AuthUser | undefined;
+  const requestedPlan = req.body?.plan;
+
+  if (!user) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    });
+    return;
+  }
+
+  const expectedPlan =
+    user.role === "student"
+      ? "student-pro"
+      : user.role === "tutor"
+        ? "tutor-pro"
+        : null;
+
+  if (!expectedPlan) {
+    res.status(403).json({
+      success: false,
+      message: "Only students and tutors can purchase Pro.",
+    });
+    return;
+  }
+
+  if (requestedPlan !== expectedPlan) {
+    res.status(400).json({
+      success: false,
+      message: "Selected plan does not match your account role.",
+    });
+    return;
+  }
+
+  next();
+};
+
+// --------------------------------------------------
+// Create monthly Stripe subscription checkout
+// --------------------------------------------------
+
 const createCheckoutSession: RequestHandler = async (
-  _req,
+  req,
   res,
   next
 ) => {
@@ -141,15 +235,57 @@ const createCheckoutSession: RequestHandler = async (
       return;
     }
 
+    if (!ObjectId.isValid(user.id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid user account.",
+      });
+      return;
+    }
+
+    const dbUser = await getDB()
+      .collection("user")
+      .findOne({ _id: new ObjectId(user.id) });
+
+    if (!dbUser) {
+      res.status(404).json({
+        success: false,
+        message: "User account not found.",
+      });
+      return;
+    }
+
+    if (dbUser.plan === "pro") {
+      res.status(400).json({
+        success: false,
+        message: "You already have an active Pro plan.",
+      });
+      return;
+    }
+
     const isTutor = user.role === "tutor";
-    const plan = isTutor ? "pro_tutor" : "pro_student";
+
+    const plan: ProPlan = isTutor
+      ? "pro_tutor"
+      : "pro_student";
+
     const amount = isTutor ? 1500 : 1000;
 
     const stripe = getStripe();
 
+    const clientURL = (
+      process.env.CLIENT_URL || ""
+    ).split(",")[0].trim().replace(/\/$/, "");
+
+    if (!clientURL) {
+      throw new Error("CLIENT_URL is missing.");
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      customer_email: user.email,
+
+      customer_email: user.email || dbUser.email,
+
       client_reference_id: user.id,
 
       line_items: [
@@ -176,6 +312,8 @@ const createCheckoutSession: RequestHandler = async (
           userId: user.id,
           role: user.role,
           plan,
+          userName: user.name || dbUser.name || "",
+          userEmail: user.email || dbUser.email || "",
         },
       },
 
@@ -183,10 +321,13 @@ const createCheckoutSession: RequestHandler = async (
         userId: user.id,
         role: user.role,
         plan,
+        userName: user.name || dbUser.name || "",
+        userEmail: user.email || dbUser.email || "",
       },
 
-      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+      success_url: `${clientURL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+
+      cancel_url: `${clientURL}/payment/cancel`,
     });
 
     res.status(200).json({
@@ -199,24 +340,15 @@ const createCheckoutSession: RequestHandler = async (
   }
 };
 
-// Student Pro: $10/month
-router.post(
-  "/create-student-checkout",
-  verifyToken,
-  verifyStudent,
-  createCheckoutSession
-);
-
-// Tutor Pro: $15/month
-router.post(
-  "/create-tutor-checkout",
-  verifyToken,
-  verifyTutor,
-  createCheckoutSession
-);
-
+// --------------------------------------------------
 // Verify checkout session
-router.post("/verify-session", verifyToken, async (req, res, next) => {
+// --------------------------------------------------
+
+const verifyCheckoutSession: RequestHandler = async (
+  req,
+  res,
+  next
+) => {
   try {
     const user = res.locals.user as AuthUser;
 
@@ -233,12 +365,15 @@ router.post("/verify-session", verifyToken, async (req, res, next) => {
     }
 
     const stripe = getStripe();
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    const session = await stripe.checkout.sessions.retrieve(
+      sessionId
+    );
 
     if (
       session.status !== "complete" ||
       session.mode !== "subscription" ||
-      !["paid", "no_payment_required"].includes(session.payment_status)
+      session.payment_status !== "paid"
     ) {
       res.status(400).json({
         success: false,
@@ -258,7 +393,10 @@ router.post("/verify-session", verifyToken, async (req, res, next) => {
       return;
     }
 
-    if (user.role !== "student" && user.role !== "tutor") {
+    if (
+      user.role !== "student" &&
+      user.role !== "tutor"
+    ) {
       res.status(403).json({
         success: false,
         message: "Invalid account role.",
@@ -275,7 +413,9 @@ router.post("/verify-session", verifyToken, async (req, res, next) => {
     }
 
     const expectedPlan =
-      user.role === "tutor" ? "pro_tutor" : "pro_student";
+      user.role === "tutor"
+        ? "pro_tutor"
+        : "pro_student";
 
     if (session.metadata?.plan !== expectedPlan) {
       res.status(400).json({
@@ -285,10 +425,7 @@ router.post("/verify-session", verifyToken, async (req, res, next) => {
       return;
     }
 
-    const subscriptionId =
-      typeof session.subscription === "string"
-        ? session.subscription
-        : session.subscription?.id;
+    const subscriptionId = getSubscriptionId(session);
 
     if (!subscriptionId) {
       res.status(400).json({
@@ -312,6 +449,18 @@ router.post("/verify-session", verifyToken, async (req, res, next) => {
       return;
     }
 
+    if (
+      subscription.metadata.userId !== user.id ||
+      subscription.metadata.role !== user.role ||
+      subscription.metadata.plan !== expectedPlan
+    ) {
+      res.status(403).json({
+        success: false,
+        message: "Subscription details do not match your account.",
+      });
+      return;
+    }
+
     await updateUserSubscription(
       user.id,
       subscription.id,
@@ -330,10 +479,16 @@ router.post("/verify-session", verifyToken, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
+};
 
+// --------------------------------------------------
 // Stripe webhook
-const stripeWebhook: RequestHandler = async (req, res) => {
+// --------------------------------------------------
+
+const stripeWebhook: RequestHandler = async (
+  req,
+  res
+) => {
   const signature = req.headers["stripe-signature"];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -353,6 +508,7 @@ const stripeWebhook: RequestHandler = async (req, res) => {
   }
 
   const stripe = getStripe();
+
   let event: Stripe.Event;
 
   try {
@@ -369,39 +525,41 @@ const stripeWebhook: RequestHandler = async (req, res) => {
 
   try {
     switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded": {
+        const session =
+          event.data.object as Stripe.Checkout.Session;
 
-        const subscriptionId =
-          typeof session.subscription === "string"
-            ? session.subscription
-            : session.subscription?.id;
+        if (
+          session.payment_status === "paid" &&
+          session.status === "complete"
+        ) {
+          const subscriptionId = getSubscriptionId(session);
 
-        if (subscriptionId) {
+          if (!subscriptionId) {
+            throw new Error("Subscription ID not found.");
+          }
+
           const subscription =
             await stripe.subscriptions.retrieve(subscriptionId);
 
-          const userId = subscription.metadata.userId;
+          const userId = session.metadata?.userId;
 
-          if (userId) {
-            const isActive =
-              subscription.status === "active" ||
-              subscription.status === "trialing";
-
+          if (
+            userId &&
+            subscription.metadata.userId === userId &&
+            (subscription.status === "active" ||
+              subscription.status === "trialing")
+          ) {
             await updateUserSubscription(
               userId,
               subscription.id,
               subscription.status,
-              isActive
+              true
             );
-          }
-        }
 
-        if (
-          session.payment_status === "paid" ||
-          session.payment_status === "no_payment_required"
-        ) {
-          await savePaymentRecord(session);
+            await savePaymentRecord(session);
+          }
         }
 
         break;
@@ -445,7 +603,9 @@ const stripeWebhook: RequestHandler = async (req, res) => {
         break;
     }
 
-    res.status(200).json({ received: true });
+    res.status(200).json({
+      received: true,
+    });
   } catch (error) {
     console.error("Stripe webhook processing failed:", error);
 
@@ -456,6 +616,64 @@ const stripeWebhook: RequestHandler = async (req, res) => {
   }
 };
 
-router.post("/webhook", stripeWebhook);
+// --------------------------------------------------
+// Get logged-in user's payment history
+// --------------------------------------------------
+
+const getMyPayments: RequestHandler = async (
+  _req,
+  res,
+  next
+) => {
+  try {
+    const user = res.locals.user as AuthUser;
+
+    const { payments } = getCollections();
+
+    const records = await payments
+      .find({ userId: user.id })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      payments: records,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// --------------------------------------------------
+// Routes
+// --------------------------------------------------
+
+// Common PRO checkout endpoint for Student and Tutor
+router.post(
+  "/create-checkout-session",
+  verifyToken,
+  validateCheckoutPlan,
+  createCheckoutSession
+);
+
+// Verify payment
+router.post(
+  "/verify-session",
+  verifyToken,
+  verifyCheckoutSession
+);
+
+// Logged-in user's payment history
+router.get(
+  "/my-payments",
+  verifyToken,
+  getMyPayments
+);
+
+// Stripe webhook
+router.post(
+  "/webhook",
+  stripeWebhook
+);
 
 export default router;
