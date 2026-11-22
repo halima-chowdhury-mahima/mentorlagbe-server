@@ -2,6 +2,10 @@
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 
+
+
+
+
 import { getCollections } from "../config/collections.js";
 import { getDB } from "../config/db.js";
 import {
@@ -183,6 +187,8 @@ router.get("/payments", async (_req, res, next) => {
     next(error);
   }
 });
+
+
 
 // ==========================================
 // GET ALL APPLICATIONS
