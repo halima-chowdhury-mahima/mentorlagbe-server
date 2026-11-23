@@ -21,7 +21,7 @@ interface AuthUser {
   plan?: string;
 }
 
-type ProPlan = "pro_student" | "pro_tutor";
+type ApprovalStatus = "pending" | "approved" | "rejected";
 
 interface InvoicePaymentEntry {
   payment?: {
@@ -35,10 +35,6 @@ interface InvoiceWithPayments {
     data?: InvoicePaymentEntry[];
   };
 }
-
-// --------------------------------------------------
-// HELPERS
-// --------------------------------------------------
 
 const getSubscriptionId = (
   session: Stripe.Checkout.Session
@@ -64,19 +60,14 @@ const getPaymentIntentFromInvoice = async (
     expand: ["payments.data.payment.payment_intent"],
   });
 
-  const invoiceWithPayments =
-    invoice as unknown as InvoiceWithPayments;
+  const data = invoice as unknown as InvoiceWithPayments;
 
-  for (const entry of invoiceWithPayments.payments?.data ?? []) {
-    const intent = entry.payment?.payment_intent;
+  for (const entry of data.payments?.data ?? []) {
+    if (entry.payment?.type !== "payment_intent") continue;
 
-    if (entry.payment?.type !== "payment_intent") {
-      continue;
-    }
+    const intent = entry.payment.payment_intent;
 
-    if (typeof intent === "string") {
-      return intent;
-    }
+    if (typeof intent === "string") return intent;
 
     if (intent && typeof intent === "object" && intent.id) {
       return intent.id;
@@ -95,19 +86,17 @@ const getInitialPaymentIntentId = async (
       ? session.payment_intent
       : session.payment_intent?.id ?? null;
 
-  if (directIntent) {
-    return directIntent;
-  }
+  if (directIntent) return directIntent;
 
-  const invoiceId = getSessionInvoiceId(session);
+  const sessionInvoiceId = getSessionInvoiceId(session);
 
-  if (invoiceId) {
-    const intentId = await getPaymentIntentFromInvoice(
+  if (sessionInvoiceId) {
+    const intent = await getPaymentIntentFromInvoice(
       stripe,
-      invoiceId
+      sessionInvoiceId
     );
 
-    if (intentId) return intentId;
+    if (intent) return intent;
   }
 
   const subscriptionId = getSubscriptionId(session);
@@ -121,82 +110,71 @@ const getInitialPaymentIntentId = async (
 
   const latestInvoice = subscription.latest_invoice;
 
-  const latestInvoiceId =
+  const invoiceId =
     typeof latestInvoice === "string"
       ? latestInvoice
       : latestInvoice?.id ?? null;
 
-  if (!latestInvoiceId) return null;
+  if (!invoiceId) return null;
 
-  return getPaymentIntentFromInvoice(stripe, latestInvoiceId);
+  return getPaymentIntentFromInvoice(stripe, invoiceId);
 };
 
-// Update both Better Auth's "user" collection and the
-// application's "users" collection.
-const updateUserSubscription = async (
+// --------------------------------------------------
+// UPDATE USER PLAN
+// --------------------------------------------------
+
+const updateUserPlan = async (
   userId: string,
   subscriptionId: string,
-  status: Stripe.Subscription.Status,
-  allowReplace = false
+  approvalStatus: ApprovalStatus,
+  subscriptionStatus: string
 ): Promise<void> => {
   if (!ObjectId.isValid(userId)) {
     throw new Error("Invalid user ID.");
   }
 
-  const active =
-    status === "active" || status === "trialing";
-
-  const userIdObject = new ObjectId(userId);
-
-  const filter = allowReplace
-    ? { _id: userIdObject }
-    : {
-        _id: userIdObject,
-        stripeSubscriptionId: subscriptionId,
-      };
+  const isApproved =
+    approvalStatus === "approved" &&
+    ["active", "trialing"].includes(subscriptionStatus);
 
   const update = {
     $set: {
-      plan: active ? "pro" : "free",
+      plan: isApproved ? "pro" : "free",
+      approvalStatus,
       stripeSubscriptionId: subscriptionId,
-      subscriptionStatus: status,
+      subscriptionStatus,
       updatedAt: new Date(),
     },
   };
 
   const db = getDB();
   const { users } = getCollections();
+  const id = new ObjectId(userId);
 
   const results = await Promise.all([
-    db.collection("user").updateOne(filter, update),
-    users.updateOne(filter, update),
+    db.collection("user").updateOne({ _id: id }, update),
+    users.updateOne({ _id: id }, update),
   ]);
 
   if (
     results[0].matchedCount === 0 &&
     results[1].matchedCount === 0
   ) {
-    console.warn(
-      `Subscription update skipped: user=${userId}, subscription=${subscriptionId}`
-    );
+    throw new Error("User account could not be updated.");
   }
 };
 
 // --------------------------------------------------
-// SAVE PAYMENT RECORD
+// SAVE PAYMENT
 // --------------------------------------------------
-
 
 const savePaymentRecord = async (
   session: Stripe.Checkout.Session
 ): Promise<void> => {
   const metadata = session.metadata;
 
-  if (
-    !metadata?.userId ||
-    !metadata?.role ||
-    !metadata?.plan
-  ) {
+  if (!metadata?.userId || !metadata?.role || !metadata?.plan) {
     throw new Error("Payment metadata is incomplete.");
   }
 
@@ -205,9 +183,7 @@ const savePaymentRecord = async (
     session.status !== "complete" ||
     session.payment_status !== "paid"
   ) {
-    throw new Error(
-      "Checkout session is not a completed paid subscription."
-    );
+    throw new Error("Checkout session is not a completed paid subscription.");
   }
 
   const subscriptionId = getSubscriptionId(session);
@@ -226,14 +202,15 @@ const savePaymentRecord = async (
       session
     );
   } catch (error) {
-    console.error(
-      "Could not retrieve initial PaymentIntent:",
-      error
-    );
+    console.error("Initial PaymentIntent lookup failed:", error);
   }
 
   const { payments } = getCollections();
   const now = new Date();
+
+  const existing = await payments.findOne({
+    stripeSessionId: session.id,
+  });
 
   const paymentRecord = {
     userId: metadata.userId,
@@ -271,52 +248,53 @@ const savePaymentRecord = async (
     paymentStatus: "paid",
     status: "paid",
     method: "stripe",
-    refundStatus: "not_refunded",
-    cancellationStatus: "not_cancelled",
     paidAt: session.created
       ? new Date(session.created * 1000)
       : now,
     updatedAt: now,
   };
 
-  try {
-    await payments.updateOne(
-      { stripeSessionId: session.id },
-      {
-        $set: paymentRecord,
-        $setOnInsert: {
-          createdAt: now,
-        },
+  await payments.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $set: paymentRecord,
+      $setOnInsert: {
+        createdAt: now,
+        approvalStatus: "pending",
+        refundStatus: "not_refunded",
+        cancellationStatus: "not_cancelled",
       },
-      { upsert: true }
-    );
-  } catch (error) {
-    // If webhook and verification run simultaneously,
-    // the unique index may reject the second insert.
-    const mongoError = error as { code?: number };
+    },
+    { upsert: true }
+  );
 
-    if (mongoError.code !== 11000) {
-      throw error;
+  // Old records without approvalStatus are treated as pending.
+  await payments.updateOne(
+    {
+      stripeSessionId: session.id,
+      approvalStatus: { $exists: false },
+    },
+    {
+      $set: {
+        approvalStatus: "pending",
+        refundStatus: "not_refunded",
+      },
     }
-
-    await payments.updateOne(
-      { stripeSessionId: session.id },
-      {
-        $set: paymentRecord,
-      }
-    );
-  }
+  );
 
   if (!paymentIntentId) {
     console.warn(
-      `Payment saved without PaymentIntent: session=${session.id}`
+      `Payment saved without PaymentIntent: ${session.id}`
     );
   }
+
+  // IMPORTANT:
+  // Do not activate PRO here.
+  // Admin approval is required.
 };
 
-
 // --------------------------------------------------
-// VALIDATE CHECKOUT PLAN
+// VALIDATE PLAN
 // --------------------------------------------------
 
 const validateCheckoutPlan: RequestHandler = (
@@ -362,7 +340,7 @@ const validateCheckoutPlan: RequestHandler = (
 };
 
 // --------------------------------------------------
-// CREATE CHECKOUT SESSION
+// CREATE CHECKOUT
 // --------------------------------------------------
 
 const createCheckoutSession: RequestHandler = async (
@@ -373,17 +351,6 @@ const createCheckoutSession: RequestHandler = async (
   try {
     const user = res.locals.user as AuthUser;
 
-    if (
-      user.role !== "student" &&
-      user.role !== "tutor"
-    ) {
-      res.status(403).json({
-        success: false,
-        message: "Only students and tutors can purchase Pro.",
-      });
-      return;
-    }
-
     if (!ObjectId.isValid(user.id)) {
       res.status(400).json({
         success: false,
@@ -392,9 +359,15 @@ const createCheckoutSession: RequestHandler = async (
       return;
     }
 
-    const dbUser = await getDB()
-      .collection("user")
-      .findOne({ _id: new ObjectId(user.id) });
+    const db = getDB();
+
+    const dbUser =
+      (await db.collection("user").findOne({
+        _id: new ObjectId(user.id),
+      })) ||
+      (await db.collection("users").findOne({
+        _id: new ObjectId(user.id),
+      }));
 
     if (!dbUser) {
       res.status(404).json({
@@ -406,6 +379,7 @@ const createCheckoutSession: RequestHandler = async (
 
     if (
       dbUser.plan === "pro" &&
+      dbUser.approvalStatus === "approved" &&
       ["active", "trialing"].includes(
         String(dbUser.subscriptionStatus || "")
       )
@@ -417,13 +391,24 @@ const createCheckoutSession: RequestHandler = async (
       return;
     }
 
+    const { payments } = getCollections();
+
+    const pendingPayment = await payments.findOne({
+      userId: user.id,
+      paymentStatus: "paid",
+      approvalStatus: "pending",
+    });
+
+    if (pendingPayment) {
+      res.status(409).json({
+        success: false,
+        message: "You already have a payment awaiting admin approval.",
+      });
+      return;
+    }
+
     const isTutor = user.role === "tutor";
-
-    const plan: ProPlan = isTutor
-      ? "pro_tutor"
-      : "pro_student";
-
-    // Amounts are in cents: $15 and $10.
+    const plan = isTutor ? "pro_tutor" : "pro_student";
     const amount = isTutor ? 1500 : 1000;
 
     const clientURL = (
@@ -452,13 +437,10 @@ const createCheckoutSession: RequestHandler = async (
               name: isTutor
                 ? "MentorLagbe Pro Tutor"
                 : "MentorLagbe Pro Student",
-              description:
-                "MentorLagbe monthly Pro subscription",
+              description: "MentorLagbe monthly Pro subscription",
             },
             unit_amount: amount,
-            recurring: {
-              interval: "month",
-            },
+            recurring: { interval: "month" },
           },
           quantity: 1,
         },
@@ -499,7 +481,7 @@ const createCheckoutSession: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// VERIFY CHECKOUT SESSION
+// VERIFY CHECKOUT
 // --------------------------------------------------
 
 const verifyCheckoutSession: RequestHandler = async (
@@ -509,10 +491,7 @@ const verifyCheckoutSession: RequestHandler = async (
 ) => {
   try {
     const user = res.locals.user as AuthUser;
-
-    const { sessionId } = req.body as {
-      sessionId?: string;
-    };
+    const { sessionId } = req.body as { sessionId?: string };
 
     if (!sessionId) {
       res.status(400).json({
@@ -545,8 +524,7 @@ const verifyCheckoutSession: RequestHandler = async (
     ) {
       res.status(403).json({
         success: false,
-        message:
-          "This subscription does not belong to your account.",
+        message: "This subscription does not belong to your account.",
       });
       return;
     }
@@ -562,24 +540,16 @@ const verifyCheckoutSession: RequestHandler = async (
       return;
     }
 
-    if (session.metadata?.role !== user.role) {
+    const expectedPlan =
+      user.role === "tutor" ? "pro_tutor" : "pro_student";
+
+    if (
+      session.metadata?.role !== user.role ||
+      session.metadata?.plan !== expectedPlan
+    ) {
       res.status(403).json({
         success: false,
-        message:
-          "Subscription role does not match your account.",
-      });
-      return;
-    }
-
-    const expectedPlan =
-      user.role === "tutor"
-        ? "pro_tutor"
-        : "pro_student";
-
-    if (session.metadata?.plan !== expectedPlan) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid subscription plan.",
+        message: "Subscription details do not match your account.",
       });
       return;
     }
@@ -615,26 +585,26 @@ const verifyCheckoutSession: RequestHandler = async (
     ) {
       res.status(403).json({
         success: false,
-        message:
-          "Subscription details do not match your account.",
+        message: "Subscription details do not match your account.",
       });
       return;
     }
 
     await savePaymentRecord(session);
 
-    await updateUserSubscription(
+    // Payment received, but PRO remains locked until Admin approval.
+    await updateUserPlan(
       user.id,
       subscription.id,
-      subscription.status,
-      true
+      "pending",
+      subscription.status
     );
 
     res.status(200).json({
       success: true,
-      message:
-        "Your MentorLagbe Pro subscription is active!",
-      plan: "pro",
+      message: "Payment received. Your Pro plan is pending admin approval.",
+      plan: "free",
+      approvalStatus: "pending",
       subscriptionStatus: subscription.status,
     });
   } catch (error) {
@@ -646,10 +616,7 @@ const verifyCheckoutSession: RequestHandler = async (
 // STRIPE WEBHOOK
 // --------------------------------------------------
 
-const stripeWebhook: RequestHandler = async (
-  req,
-  res
-) => {
+const stripeWebhook: RequestHandler = async (req, res) => {
   const signature = req.headers["stripe-signature"];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -708,17 +675,28 @@ const stripeWebhook: RequestHandler = async (
 
           if (
             userId &&
-            subscription.metadata.userId === userId &&
-            (subscription.status === "active" ||
-              subscription.status === "trialing")
+            subscription.metadata.userId === userId
           ) {
             await savePaymentRecord(session);
 
-            await updateUserSubscription(
+            const { payments } = getCollections();
+
+            const payment = await payments.findOne({
+              stripeSubscriptionId: subscriptionId,
+            });
+
+            const approvalStatus: ApprovalStatus =
+              payment?.approvalStatus === "approved"
+                ? "approved"
+                : payment?.approvalStatus === "rejected"
+                  ? "rejected"
+                  : "pending";
+
+            await updateUserPlan(
               userId,
-              subscription.id,
-              subscription.status,
-              true
+              subscriptionId,
+              approvalStatus,
+              subscription.status
             );
           }
         }
@@ -731,13 +709,37 @@ const stripeWebhook: RequestHandler = async (
         const subscription =
           event.data.object as Stripe.Subscription;
 
-        const userId = subscription.metadata.userId;
+        const { payments } = getCollections();
 
-        if (userId) {
-          await updateUserSubscription(
-            userId,
+        const payment = await payments.findOne({
+          stripeSubscriptionId: subscription.id,
+        });
+
+        // Do not grant PRO based on Stripe status alone.
+        // Only an approved payment can keep PRO active.
+        if (payment?.userId) {
+          const approvalStatus: ApprovalStatus =
+            payment.approvalStatus === "approved"
+              ? "approved"
+              : payment.approvalStatus === "rejected"
+                ? "rejected"
+                : "pending";
+
+          await updateUserPlan(
+            String(payment.userId),
             subscription.id,
+            approvalStatus,
             subscription.status
+          );
+
+          await payments.updateOne(
+            { _id: payment._id },
+            {
+              $set: {
+                subscriptionStatus: subscription.status,
+                updatedAt: new Date(),
+              },
+            }
           );
         }
 
@@ -760,7 +762,7 @@ const stripeWebhook: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// USER: GET MY PAYMENTS
+// GET MY PAYMENTS
 // --------------------------------------------------
 
 const getMyPayments: RequestHandler = async (
@@ -788,7 +790,7 @@ const getMyPayments: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// ADMIN: GET ALL PRO PAYMENTS
+// ADMIN: GET ALL PAYMENTS
 // --------------------------------------------------
 
 const getAllPayments: RequestHandler = async (
@@ -823,7 +825,185 @@ const getAllPayments: RequestHandler = async (
 };
 
 // --------------------------------------------------
-// ADMIN: CANCEL SUBSCRIPTION + REFUND PAYMENT
+// ADMIN: APPROVE PAYMENT
+// --------------------------------------------------
+
+const approvePayment: RequestHandler = async (
+  req,
+  res,
+  next
+) => {
+  try {
+    const paymentId = req.params.paymentId;
+
+if (
+  typeof paymentId !== "string" ||
+  !ObjectId.isValid(paymentId)
+) {
+  res.status(400).json({
+    success: false,
+    message: "Invalid payment ID.",
+  });
+  return;
+}
+
+    const { payments } = getCollections();
+
+    const payment = await payments.findOne({
+      _id: new ObjectId(paymentId),
+    });
+
+    if (!payment) {
+      res.status(404).json({
+        success: false,
+        message: "Payment record not found.",
+      });
+      return;
+    }
+
+    if (payment.approvalStatus === "approved") {
+      res.status(200).json({
+        success: true,
+        message: "Payment is already approved.",
+        approvalStatus: "approved",
+      });
+      return;
+    }
+
+    if (payment.approvalStatus === "rejected") {
+      res.status(409).json({
+        success: false,
+        message: "A rejected payment cannot be approved.",
+      });
+      return;
+    }
+
+    if (
+      payment.paymentStatus !== "paid" &&
+      payment.status !== "paid"
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Only successful payments can be approved.",
+      });
+      return;
+    }
+
+    if (
+      payment.refundStatus === "pending" ||
+      payment.refundStatus === "succeeded"
+    ) {
+      res.status(409).json({
+        success: false,
+        message: "This payment has a refund in progress or completed.",
+      });
+      return;
+    }
+
+    const subscriptionId =
+      payment.stripeSubscriptionId ||
+      payment.subscriptionId;
+
+    if (!subscriptionId) {
+      res.status(400).json({
+        success: false,
+        message: "Stripe subscription ID is missing.",
+      });
+      return;
+    }
+
+    const stripe = getStripe();
+
+    const subscription =
+      await stripe.subscriptions.retrieve(subscriptionId);
+
+    if (
+      subscription.status !== "active" &&
+      subscription.status !== "trialing"
+    ) {
+      res.status(409).json({
+        success: false,
+        message: "The Stripe subscription is not active.",
+      });
+      return;
+    }
+
+    if (
+      subscription.metadata.userId !== String(payment.userId)
+    ) {
+      res.status(403).json({
+        success: false,
+        message: "Subscription owner does not match the payment.",
+      });
+      return;
+    }
+
+    const updateResult = await payments.updateOne(
+      {
+        _id: new ObjectId(paymentId),
+        approvalStatus: { $nin: ["approved", "rejected"] },
+        paymentStatus: "paid",
+      },
+      {
+        $set: {
+          approvalStatus: "approved",
+          approvedAt: new Date(),
+          subscriptionStatus: subscription.status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (updateResult.modifiedCount === 0) {
+      const latest = await payments.findOne({
+        _id: new ObjectId(paymentId),
+      });
+
+      if (latest?.approvalStatus !== "approved") {
+        res.status(409).json({
+          success: false,
+          message: "Payment status changed. Refresh and try again.",
+        });
+        return;
+      }
+    }
+
+    try {
+      await updateUserPlan(
+        String(payment.userId),
+        subscriptionId,
+        "approved",
+        subscription.status
+      );
+    } catch (error) {
+      // Revert approval if user records could not be synchronized.
+      await payments.updateOne(
+        { _id: new ObjectId(paymentId) },
+        {
+          $set: {
+            approvalStatus: "pending",
+            updatedAt: new Date(),
+          },
+          $unset: { approvedAt: "" },
+        }
+      );
+
+      throw error;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Payment approved. PRO is now active.",
+      approvalStatus: "approved",
+      plan: "pro",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// --------------------------------------------------
+// ADMIN: REJECT + CANCEL + REFUND
 // --------------------------------------------------
 
 const rejectPayment: RequestHandler = async (
@@ -834,16 +1014,16 @@ const rejectPayment: RequestHandler = async (
   try {
     const paymentId = req.params.paymentId;
 
-    if (
-      typeof paymentId !== "string" ||
-      !ObjectId.isValid(paymentId)
-    ) {
-      res.status(400).json({
-        success: false,
-        message: "Invalid payment ID.",
-      });
-      return;
-    }
+if (
+  typeof paymentId !== "string" ||
+  !ObjectId.isValid(paymentId)
+) {
+  res.status(400).json({
+    success: false,
+    message: "Invalid payment ID.",
+  });
+  return;
+}
 
     const { payments } = getCollections();
 
@@ -866,7 +1046,7 @@ const rejectPayment: RequestHandler = async (
       res.status(200).json({
         success: true,
         message: "This payment has already been refunded.",
-        payment,
+        refundStatus: "succeeded",
       });
       return;
     }
@@ -878,8 +1058,7 @@ const rejectPayment: RequestHandler = async (
     ) {
       res.status(400).json({
         success: false,
-        message:
-          "Only successful payments can be rejected and refunded.",
+        message: "Only successful payments can be rejected and refunded.",
       });
       return;
     }
@@ -898,36 +1077,72 @@ const rejectPayment: RequestHandler = async (
 
     const stripe = getStripe();
 
-    // Retrieve subscription before attempting cancellation.
-    const subscription =
-      await stripe.subscriptions.retrieve(subscriptionId);
-
-    // Cancel the subscription if it is still active.
-    if (subscription.status !== "canceled") {
-      await stripe.subscriptions.cancel(subscriptionId);
-    }
-
-    // Save cancellation immediately. If refund fails,
-    // the database still records that the subscription was canceled.
+    // Reject first, so PRO access is removed even if refund fails.
     await payments.updateOne(
       { _id: new ObjectId(paymentId) },
       {
         $set: {
-          cancellationStatus: "canceled",
-          subscriptionStatus: "canceled",
+          approvalStatus: "rejected",
           rejectedAt: payment.rejectedAt || new Date(),
           updatedAt: new Date(),
         },
       }
     );
 
-    await updateUserSubscription(
-      payment.userId,
+    await updateUserPlan(
+      String(payment.userId),
       subscriptionId,
+      "rejected",
       "canceled"
     );
 
-    // Find the initial PaymentIntent.
+    // Cancel the Stripe subscription.
+    try {
+      const subscription =
+        await stripe.subscriptions.retrieve(subscriptionId);
+
+      if (subscription.status !== "canceled") {
+        await stripe.subscriptions.cancel(subscriptionId);
+      }
+
+      await payments.updateOne(
+        { _id: new ObjectId(paymentId) },
+        {
+          $set: {
+            cancellationStatus: "canceled",
+            subscriptionStatus: "canceled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+    } catch (cancelError) {
+      const reason =
+        cancelError instanceof Error
+          ? cancelError.message
+          : "Stripe subscription cancellation failed.";
+
+      await payments.updateOne(
+        { _id: new ObjectId(paymentId) },
+        {
+          $set: {
+            cancellationStatus: "failed",
+            cancellationFailureReason: reason,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.status(502).json({
+        success: false,
+        approvalStatus: "rejected",
+        refundStatus: payment.refundStatus || "not_refunded",
+        message:
+          "Payment rejected and PRO access removed, but Stripe subscription cancellation failed. Please review this payment.",
+      });
+      return;
+    }
+
+    // Never use transactionId as a PaymentIntent ID.
     let paymentIntentId =
       payment.stripePaymentIntentId ||
       payment.paymentIntentId ||
@@ -946,28 +1161,6 @@ const rejectPayment: RequestHandler = async (
     }
 
     if (!paymentIntentId) {
-      const latestSubscription =
-        await stripe.subscriptions.retrieve(
-          subscriptionId,
-          { expand: ["latest_invoice"] }
-        );
-
-      const invoice = latestSubscription.latest_invoice;
-
-      const invoiceId =
-        typeof invoice === "string"
-          ? invoice
-          : invoice?.id ?? null;
-
-      if (invoiceId) {
-        paymentIntentId = await getPaymentIntentFromInvoice(
-          stripe,
-          invoiceId
-        );
-      }
-    }
-
-    if (!paymentIntentId) {
       await payments.updateOne(
         { _id: new ObjectId(paymentId) },
         {
@@ -975,6 +1168,7 @@ const rejectPayment: RequestHandler = async (
             refundStatus: "failed",
             refundFailureReason:
               "Initial Stripe PaymentIntent could not be found. Subscription was canceled.",
+            paymentStatus: "paid",
             status: "paid",
             updatedAt: new Date(),
           },
@@ -983,22 +1177,20 @@ const rejectPayment: RequestHandler = async (
 
       res.status(409).json({
         success: false,
+        approvalStatus: "rejected",
+        refundStatus: "failed",
         message:
-          "Subscription canceled, but the initial payment could not be found for refund. The payment record has been marked for review.",
+          "Subscription canceled, but the initial payment could not be found for refund.",
       });
       return;
     }
 
-    // Reuse the same idempotency key for an unfinished attempt.
-    // A new key is created only after a previous refund failed.
-    const previousAttempt = Number(
-      payment.refundAttempts || 0
-    );
+    const previousAttempts = Number(payment.refundAttempts || 0);
 
     const attempt =
       payment.refundStatus === "failed"
-        ? previousAttempt + 1
-        : Math.max(previousAttempt, 1);
+        ? previousAttempts + 1
+        : Math.max(previousAttempts, 1);
 
     const idempotencyKey =
       payment.refundStatus === "pending" &&
@@ -1023,14 +1215,19 @@ const rejectPayment: RequestHandler = async (
     let refund: Stripe.Refund;
 
     try {
-      refund = await stripe.refunds.create(
-        {
-          payment_intent: paymentIntentId,
-        },
-        {
-          idempotencyKey,
-        }
-      );
+      if (
+        payment.refundStatus === "pending" &&
+        payment.stripeRefundId
+      ) {
+        refund = await stripe.refunds.retrieve(
+          payment.stripeRefundId
+        );
+      } else {
+        refund = await stripe.refunds.create(
+          { payment_intent: paymentIntentId },
+          { idempotencyKey }
+        );
+      }
     } catch (refundError) {
       const reason =
         refundError instanceof Error
@@ -1043,8 +1240,9 @@ const rejectPayment: RequestHandler = async (
           $set: {
             refundStatus: "failed",
             refundFailureReason: reason,
-            cancellationStatus: "canceled",
+            paymentStatus: "paid",
             status: "paid",
+            cancellationStatus: "canceled",
             updatedAt: new Date(),
           },
         }
@@ -1052,9 +1250,10 @@ const rejectPayment: RequestHandler = async (
 
       res.status(502).json({
         success: false,
-        message:
-          "Subscription canceled, but Stripe could not complete the refund. You can retry the refund from Admin Payments.",
+        approvalStatus: "rejected",
         refundStatus: "failed",
+        message:
+          "Subscription canceled, but refund failed. You can retry from Admin Payments.",
       });
       return;
     }
@@ -1066,10 +1265,13 @@ const rejectPayment: RequestHandler = async (
       { _id: new ObjectId(paymentId) },
       {
         $set: {
+          approvalStatus: "rejected",
           paymentStatus: refundSucceeded ? "refunded" : "paid",
           status: refundSucceeded
             ? "refunded"
-            : "refund_pending",
+            : refundStatus === "pending"
+              ? "refund_pending"
+              : "paid",
           refundStatus,
           stripeRefundId: refund.id,
           refundId: refund.id,
@@ -1089,6 +1291,8 @@ const rejectPayment: RequestHandler = async (
 
     res.status(200).json({
       success: true,
+      approvalStatus: "rejected",
+      refundStatus,
       message: refundSucceeded
         ? "Subscription canceled and initial payment refunded successfully."
         : "Subscription canceled. Stripe is processing the refund.",
@@ -1133,6 +1337,13 @@ router.get(
   verifyToken,
   verifyAdmin,
   getAllPayments
+);
+
+router.post(
+  "/admin/:paymentId/approve",
+  verifyToken,
+  verifyAdmin,
+  approvePayment
 );
 
 router.post(
