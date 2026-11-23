@@ -13,7 +13,7 @@ const router = Router();
 // POST: Student applies for a tuition
 router.post("/", verifyToken, verifyStudent, async (req, res, next) => {
   try {
-    const { tuitionId, message } = req.body;
+    const { tuitionId, name, email, phone, message } = req.body;
 
     if (!tuitionId || !ObjectId.isValid(tuitionId)) {
       res.status(400).json({
@@ -28,6 +28,56 @@ router.post("/", verifyToken, verifyStudent, async (req, res, next) => {
       name: string;
       email: string;
     };
+
+    // Validate student information
+    const studentName =
+      typeof name === "string" ? name.trim() : user.name?.trim() || "";
+
+    const studentEmail =
+      typeof email === "string"
+        ? email.trim().toLowerCase()
+        : user.email?.trim().toLowerCase() || "";
+
+    const studentPhone =
+      typeof phone === "string" ? phone.trim() : "";
+
+    const studentMessage =
+      typeof message === "string" ? message.trim() : "";
+
+    if (!studentName) {
+      res.status(400).json({
+        success: false,
+        message: "Please enter your full name.",
+      });
+      return;
+    }
+
+    if (
+      !studentEmail ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(studentEmail)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+      return;
+    }
+
+    if (!studentPhone || studentPhone.length < 7 || studentPhone.length > 20) {
+      res.status(400).json({
+        success: false,
+        message: "Please enter a valid phone number.",
+      });
+      return;
+    }
+
+    if (studentMessage.length > 1000) {
+      res.status(400).json({
+        success: false,
+        message: "Message cannot exceed 1000 characters.",
+      });
+      return;
+    }
 
     const { tuitions, applications } = getCollections();
 
@@ -60,8 +110,12 @@ router.post("/", verifyToken, verifyStudent, async (req, res, next) => {
     const application = {
       tuitionId,
       studentId: user.id,
-      studentName: user.name,
-      studentEmail: user.email,
+
+      // Student contact information
+      studentName,
+      studentEmail,
+      studentPhone,
+
       tutorId: tuition.tutorId,
 
       tuitionTitle: tuition.title ?? "Untitled Tuition",
@@ -73,7 +127,7 @@ router.post("/", verifyToken, verifyStudent, async (req, res, next) => {
       schedule: tuition.schedule ?? "Not specified",
       image: tuition.image ?? "",
 
-      message: typeof message === "string" ? message.trim() : "",
+      message: studentMessage,
       status: "pending",
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -120,10 +174,7 @@ router.get(
               })
             : null;
 
-          const image =
-            application.image ||
-            tuition?.image ||
-            "";
+          const image = application.image || tuition?.image || "";
 
           const title =
             application.tuitionTitle ||
@@ -162,7 +213,6 @@ router.get(
 
           return {
             ...application,
-
             tuitionTitle: title,
             subject,
             classLevel,
